@@ -27,7 +27,11 @@ ROOT = Path(__file__).resolve().parent
 LOG_DIR = Path(os.environ.get("STS_AI_LOG_DIR", ROOT / "logs"))
 CODEX_APP_COMMAND = Path("/Applications/Codex.app/Contents/Resources/codex")
 OPENAI_API_DISABLED_REASON: str | None = None
+OPENAI_API_LAST_ERROR: str | None = None
 POTION_USED_TURNS: set[tuple[str, int, int, int]] = set()
+LAST_CHOSEN_MAP_NODE: dict[str, Any] | None = None
+SEED_ALPHABET = "0123456789ABCDEFGHIJKLMNPQRSTUVWXYZ"
+SEED_RE = re.compile(r"^[0-9A-Z]+$")
 
 
 ATTACK_PRIORITY = {
@@ -75,6 +79,7 @@ CARD_REWARD_PRIORITY = {
     "Anger": 68,
     "Cleave": 66,
     "Armaments": 64,
+    "Second Wind": 63,
     "Seeing Red": 62,
     "Body Slam": 35,
     "Dual Wield": 30,
@@ -112,6 +117,7 @@ CARD_BASE_DAMAGE = {
     "Immolate": 21,
     "Bludgeon": 32,
     "Fiend Fire": 21,
+    "Reaper": 4,
     "Whirlwind": 15,
     "Twin Strike": 10,
     "Wild Strike": 12,
@@ -121,6 +127,12 @@ CARD_BASE_DAMAGE = {
     "Iron Wave": 5,
     "Searing Blow": 12,
     "Sever Soul": 16,
+    "Blood for Blood": 18,
+    "Dropkick": 5,
+    "Heavy Blade": 14,
+    "Pummel": 8,
+    "Rampage": 8,
+    "Reckless Charge": 7,
 }
 
 CARD_BASE_BLOCK = {
@@ -139,6 +151,8 @@ CARD_BASE_BLOCK = {
     "Impervious": 30,
     "Entrench": 0,
     "Second Wind": 10,
+    "Sentinel": 5,
+    "Rage": 3,
 }
 
 FRONTLOAD_ATTACKS = {
@@ -188,6 +202,8 @@ class Options:
     character: str
     ascension: int
     seed: str | None
+    stop_on_game_over: bool
+    max_floor: int | None
     use_openai_api: bool
     openai_model: str
     openai_api_base: str
@@ -203,6 +219,10 @@ class LegalAction:
     action_id: str
     command: str
     description: str
+
+
+class OpenAIDecisionError(RuntimeError):
+    pass
 
 
 def setup_logging() -> None:
@@ -225,7 +245,43 @@ def normalize_available(raw: dict[str, Any]) -> set[str]:
     return {str(command).lower() for command in raw.get("available_commands", [])}
 
 
+def seed_long_to_string(seed_long: int) -> str:
+    if seed_long < 0:
+        seed_long &= (1 << 64) - 1
+    if seed_long == 0:
+        return SEED_ALPHABET[0]
+    result = ""
+    base = len(SEED_ALPHABET)
+    value = seed_long
+    while value:
+        value, remainder = divmod(value, base)
+        result = SEED_ALPHABET[remainder] + result
+    return result
+
+
+def normalize_start_seed(seed: str | None, seed_long: str | None = None) -> str | None:
+    if seed and seed_long:
+        raise ValueError("Use either --seed or --seed-long, not both")
+    if seed_long:
+        try:
+            return seed_long_to_string(int(seed_long))
+        except ValueError as error:
+            raise ValueError(f"Invalid --seed-long value: {seed_long}") from error
+    if not seed:
+        return None
+    normalized = seed.strip().upper()
+    if not normalized or not SEED_RE.fullmatch(normalized):
+        raise ValueError("--seed must contain only uppercase letters and digits")
+    invalid = sorted(set(normalized) - set(SEED_ALPHABET))
+    if invalid:
+        raise ValueError(f"--seed contains unsupported character(s): {''.join(invalid)}")
+    return normalized
+
+
 def choose_command(raw: dict[str, Any], options: Options) -> str:
+    if should_pause_run(raw, options):
+        return pause_command(raw)
+
     rule_command = choose_rule_command(raw, options)
     if should_skip_codex(raw):
         return rule_command
@@ -233,9 +289,11 @@ def choose_command(raw: dict[str, Any], options: Options) -> str:
     if options.use_openai_api:
         try:
             return choose_openai_api_command(raw, options, rule_command)
-        except Exception:
-            logging.exception("OpenAI API decision failed; falling back to rule command")
-            return rule_command
+        except Exception as error:
+            global OPENAI_API_LAST_ERROR
+            OPENAI_API_LAST_ERROR = f"{error.__class__.__name__}: {error}"
+            logging.exception("OpenAI API decision failed; stopping instead of falling back")
+            raise
 
     if options.use_codex:
         try:
@@ -255,6 +313,35 @@ def should_skip_codex(raw: dict[str, Any]) -> bool:
     return False
 
 
+def should_pause_run(raw: dict[str, Any], options: Options) -> bool:
+    if "error" in raw:
+        return False
+
+    state = raw.get("game_state") or {}
+    screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
+    if options.stop_on_game_over and screen_type in {"GAME_OVER", "DEATH"}:
+        logging.info("Pausing on game over screen")
+        return True
+
+    if options.max_floor is not None:
+        floor = int(state.get("floor") or 0)
+        if floor >= options.max_floor:
+            logging.info("Pausing because max floor reached: floor=%s max_floor=%s", floor, options.max_floor)
+            return True
+    return False
+
+
+def pause_command(raw: dict[str, Any]) -> str:
+    available = normalize_available(raw)
+    if "wait" in available:
+        return "WAIT 300"
+    if "state" in available:
+        return "STATE"
+    if "return" in available:
+        return "RETURN"
+    return "WAIT 30"
+
+
 def choose_rule_command(raw: dict[str, Any], options: Options) -> str:
     if "error" in raw:
         logging.warning("CommunicationMod error: %s", raw.get("error"))
@@ -269,7 +356,9 @@ def choose_rule_command(raw: dict[str, Any], options: Options) -> str:
             parts = ["START", options.character.upper(), str(options.ascension)]
             if options.seed:
                 parts.append(options.seed)
-            return " ".join(parts)
+            command = " ".join(parts)
+            logging.info("start_command=%s", command)
+            return command
         time.sleep(1)
         return "STATE"
 
@@ -288,12 +377,17 @@ def choose_combat_command(state: dict[str, Any], available: set[str]) -> str:
     energy = int(player.get("energy") or 0)
     incoming = estimate_incoming_damage(monsters)
     current_block = int(player.get("block") or 0)
-    target_index = choose_target(monsters)
+    target_index = choose_target(monsters, state)
     current_hp = int(player.get("current_hp") or state.get("current_hp") or 0)
 
-    lethal = choose_lethal_attack(hand, monsters, energy)
+    lethal = choose_lethal_attack(hand, monsters, energy, player)
     if lethal is not None:
         card_index, monster_index = lethal
+        return f"PLAY {card_index + 1} {monster_index}"
+
+    turn_lethal = choose_turn_lethal_attack(hand, monsters, energy, player)
+    if turn_lethal is not None:
+        card_index, monster_index = turn_lethal
         return f"PLAY {card_index + 1} {monster_index}"
 
     potion = choose_potion_command(state, available)
@@ -308,6 +402,17 @@ def choose_combat_command(state: dict[str, Any], available: set[str]) -> str:
     setup = best_setup_card(hand, energy, state, incoming, current_block)
     if setup is not None:
         return f"PLAY {setup + 1}"
+
+    untargeted_attack = best_untargeted_attack_card(hand, energy, monsters, state)
+    if untargeted_attack is not None and should_untargeted_attack_over_block(
+        hand[untargeted_attack],
+        monsters,
+        incoming,
+        current_block,
+        current_hp,
+        state,
+    ):
+        return f"PLAY {untargeted_attack + 1}"
 
     if target_index is not None:
         attack = best_attack_card(hand, energy, monsters[target_index])
@@ -325,6 +430,10 @@ def choose_combat_command(state: dict[str, Any], available: set[str]) -> str:
         block = best_block_card(hand, energy)
         if block is not None and should_play_block_card(hand[block], state, incoming, current_block, current_hp):
             return f"PLAY {block + 1}"
+
+    untargeted_attack = best_untargeted_attack_card(hand, energy, monsters, state)
+    if untargeted_attack is not None:
+        return f"PLAY {untargeted_attack + 1}"
 
     if target_index is not None:
         attack = best_attack_card(hand, energy, monsters[target_index])
@@ -353,6 +462,14 @@ def should_attack_over_block(
     damage = estimate_card_damage(card)
     if damage >= target_hp:
         return True
+    if is_gremlin_nob_fight(state):
+        return current_hp > damage_gap + 8 or damage >= max(target_hp - 8, 1)
+    if is_lagavulin_fight(state) and lagavulin_is_debuffing(state):
+        return True
+    if is_sentries_fight(state):
+        return damage_gap <= 12 and current_hp > damage_gap + 24
+    if is_act2_high_threat_fight(state) and damage >= max(target_hp - 10, 1):
+        return current_hp > damage_gap + 16 or damage_gap <= 8
     act = int(state.get("act") or 1)
     floor = int(state.get("floor") or 0)
     room_type = str(state.get("room_type") or "")
@@ -380,6 +497,8 @@ def should_play_block_card(
         return current_hp <= damage_gap + 18 or damage_gap >= 16
     if is_lagavulin_fight(state) and lagavulin_is_debuffing(state):
         return False
+    if is_chosen_fight(state) and chosen_has_hex(state):
+        return damage_gap >= 12 or current_hp <= damage_gap + 18
     return estimate_card_block(card) > 0
 
 
@@ -421,6 +540,8 @@ def setup_card_score(
         return 0
     if is_lagavulin_fight(state) and lagavulin_is_sleeping(state) and name in {"Shockwave"}:
         return 0
+    if is_chosen_fight(state) and chosen_has_hex(state) and card_type == "SKILL" and damage_gap < 12:
+        return 0
 
     deck = state.get("deck") or []
     priorities = {
@@ -443,11 +564,37 @@ def setup_card_score(
 
 def is_dangerous_combat(state: dict[str, Any]) -> bool:
     room_type = str(state.get("room_type") or "")
-    return room_type in {"MonsterRoomElite", "BossRoom"} or "Elite" in room_type or "Boss" in room_type
+    return (
+        room_type in {"MonsterRoomElite", "BossRoom"}
+        or "Elite" in room_type
+        or "Boss" in room_type
+        or any(is_high_threat_monster(monster) for monster in combat_monsters(state))
+    )
+
+
+def is_high_threat_monster(monster: dict[str, Any]) -> bool:
+    name = normalize_name(str(monster.get("name") or monster.get("id") or ""))
+    high_threat_names = {
+        "blue slaver",
+        "book of stabbing",
+        "chosen",
+        "gremlin leader",
+        "red slaver",
+        "shelled parasite",
+        "snake plant",
+        "spheric guardian",
+        "taskmaster",
+        "the champ",
+    }
+    return any(threat in name for threat in high_threat_names)
 
 
 def is_gremlin_nob_fight(state: dict[str, Any]) -> bool:
     return any("gremlin nob" in normalize_name(str(monster.get("name") or monster.get("id") or "")) for monster in combat_monsters(state))
+
+
+def is_sentries_fight(state: dict[str, Any]) -> bool:
+    return is_sentries_monster_list(combat_monsters(state))
 
 
 def is_lagavulin_fight(state: dict[str, Any]) -> bool:
@@ -470,6 +617,59 @@ def lagavulin_is_debuffing(state: dict[str, Any]) -> bool:
         intent = str(monster.get("intent") or "").upper()
         return "DEBUFF" in intent
     return False
+
+
+def is_chosen_fight(state: dict[str, Any]) -> bool:
+    return any("chosen" in monster_name(monster) for monster in combat_monsters(state))
+
+
+def is_book_of_stabbing_fight(state: dict[str, Any]) -> bool:
+    return any("book of stabbing" in monster_name(monster) for monster in combat_monsters(state))
+
+
+def is_snake_plant_fight(state: dict[str, Any]) -> bool:
+    return any("snake plant" in monster_name(monster) for monster in combat_monsters(state))
+
+
+def chosen_has_hex(state: dict[str, Any]) -> bool:
+    combat = state.get("combat_state") or {}
+    player = combat.get("player") or {}
+    for power in player.get("powers") or []:
+        if not isinstance(power, dict):
+            continue
+        name = normalize_name(str(power.get("name") or power.get("id") or ""))
+        if "hex" in name:
+            return True
+    for monster in combat_monsters(state):
+        if "chosen" not in monster_name(monster):
+            continue
+        for power in monster.get("powers") or []:
+            if not isinstance(power, dict):
+                continue
+            name = normalize_name(str(power.get("name") or power.get("id") or ""))
+            if "hex" in name:
+                return True
+    return False
+
+
+def is_act2_high_threat_fight(state: dict[str, Any]) -> bool:
+    act = int(state.get("act") or 1)
+    return act >= 2 and any(is_act2_high_threat_monster(monster) for monster in combat_monsters(state))
+
+
+def is_act2_high_threat_monster(monster: dict[str, Any]) -> bool:
+    name = monster_name(monster)
+    high_threat_names = {
+        "blue slaver",
+        "book of stabbing",
+        "chosen",
+        "gremlin leader",
+        "red slaver",
+        "snake plant",
+        "spheric guardian",
+        "taskmaster",
+    }
+    return any(threat in name for threat in high_threat_names)
 
 
 def combat_monsters(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -504,6 +704,8 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
         "codex_decisions.jsonl",
         {
             "time": time.time(),
+            "state_index": raw.get("_sts_ai_log_index"),
+            "process_id": raw.get("_sts_ai_process_id"),
             "model": options.codex_model,
             "action_id": action.action_id,
             "command": action.command,
@@ -518,14 +720,14 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
     if "error" in raw or not raw.get("in_game"):
         return fallback_command
 
-    global OPENAI_API_DISABLED_REASON
+    global OPENAI_API_DISABLED_REASON, OPENAI_API_LAST_ERROR
     if OPENAI_API_DISABLED_REASON:
-        return fallback_command
+        raise OpenAIDecisionError(f"OpenAI API disabled: {OPENAI_API_DISABLED_REASON}")
 
     api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("STS_AI_OPENAI_API_KEY")
     if not api_key:
-        logging.warning("OPENAI_API_KEY is not set; using rule command")
-        return fallback_command
+        OPENAI_API_LAST_ERROR = "missing_api_key"
+        raise OpenAIDecisionError("OPENAI_API_KEY is not set")
 
     available = normalize_available(raw)
     state = raw.get("game_state") or {}
@@ -543,8 +745,8 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
     except urllib.error.HTTPError as error:
         if error.code in {401, 403}:
             OPENAI_API_DISABLED_REASON = f"http_{error.code}"
-            logging.warning("OpenAI API disabled for this process after authentication failure: %s", OPENAI_API_DISABLED_REASON)
-            return fallback_command
+            OPENAI_API_LAST_ERROR = OPENAI_API_DISABLED_REASON
+            raise OpenAIDecisionError(f"OpenAI API authentication failed: HTTP {error.code}") from error
         raise
     action_id = str(decision.get("action_id") or "")
     by_id = {action.action_id: action for action in legal_actions}
@@ -568,6 +770,8 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
         "openai_decisions.jsonl",
         {
             "time": time.time(),
+            "state_index": raw.get("_sts_ai_log_index"),
+            "process_id": raw.get("_sts_ai_process_id"),
             "model": options.openai_model,
             "action_id": action.action_id,
             "command": final_command,
@@ -607,15 +811,30 @@ def openai_override_reason(
         if reason:
             return reason
 
-    if fallback_command.upper().startswith("POTION ") and not model_command.upper().startswith("POTION "):
-        return "ignored_rule_potion"
-
     monsters = combat.get("monsters") or []
     player = combat.get("player") or {}
     incoming = estimate_incoming_damage(monsters)
     current_block = int(player.get("block") or 0)
     current_hp = int(player.get("current_hp") or state.get("current_hp") or 0)
     damage_gap = max(incoming - current_block, 0)
+    if fallback_command.upper().startswith("POTION ") and not model_command.upper().startswith("POTION "):
+        if is_dangerous_combat(state) or damage_gap >= 22 or current_hp <= damage_gap + 18:
+            return "ignored_rule_potion"
+        return None
+    if is_gremlin_nob_fight(state):
+        model_play = parse_play_command(model_command)
+        model_card = combat_card_at(combat, model_play[0]) if model_play is not None else None
+        fallback_attack_damage = model_command_attack_damage(fallback_command, combat)
+        if (
+            model_card is not None
+            and str(model_card.get("type") or "").upper() == "SKILL"
+            and estimate_card_block(model_card) > 0
+            and fallback_attack_damage > 0
+            and current_hp > damage_gap + 10
+        ):
+            return "nob_avoid_skill_block"
+        if model_command_attack_damage(model_command, combat) > 0 and current_hp > damage_gap + 8:
+            return None
     if damage_gap <= 0 and model_command_is_pure_block_play(model_command, combat):
         return "no_incoming_avoid_block"
 
@@ -627,14 +846,25 @@ def openai_override_reason(
     if damage_gap < 10 and current_hp > damage_gap + 18:
         return None
 
+    model_attack_damage = model_command_attack_damage(model_command, combat)
+    model_play = parse_play_command(model_command)
+    model_card = combat_card_at(combat, model_play[0]) if model_play is not None else None
+    if model_attack_damage > 0 and confidence >= 0.75:
+        if model_card is not None and effective_card_cost(model_card) == 0:
+            return None
+        if current_hp > damage_gap + 20:
+            return None
+
     if (
         is_dangerous_combat(state)
         and current_hp > damage_gap + 30
-        and model_command_attack_damage(model_command, combat) >= 10
+        and model_attack_damage >= 10
     ):
         return None
 
     if model_command_is_lethal_attack(model_command, combat):
+        return None
+    if model_command_starts_turn_lethal(model_command, combat):
         return None
     if model_command_is_defensive_play(model_command, combat):
         if model_command.upper().startswith("POTION USE") and potion_used_this_combat_turn(state):
@@ -702,6 +932,19 @@ def screen_command_score(state: dict[str, Any], command: str) -> int | None:
         options = screen_choices(state, screen_state) or [str(option) for option in screen_state.get("rest_options") or []]
         if index is not None and 0 <= index < len(options):
             return rest_option_score(options[index], state)
+    if screen_type == "SHOP_SCREEN":
+        if verb == "LEAVE":
+            return 64
+        index = command_choice_index(parts)
+        choices = screen_choices(state, screen_state)
+        if index is not None and 0 <= index < len(choices):
+            score = shop_choice_score(state, screen_state, choices[index])
+            return score if score is not None else 35
+    if screen_type == "SHOP_ROOM":
+        if verb == "PROCEED":
+            return 80 if not should_enter_shop_room(state) else 35
+        if verb == "CHOOSE":
+            return 78 if should_enter_shop_room(state) else 20
     return None
 
 
@@ -729,7 +972,12 @@ def build_decision_payload(
                 "Do not play pure block cards when there is no incoming damage.",
                 "When unblocked incoming damage is high, block or use a defensive potion unless an attack kills an attacker immediately.",
                 "For Ironclad Act 1, value frontloaded damage, Bash/Vulnerable setup, premium attacks, and strong relics.",
+                "Against Gremlin Nob, prefer attacks and avoid skills unless the HP loss is critical.",
+                "Against Lagavulin, set up while it sleeps, attack through debuff turns, and block real attack turns.",
+                "Against Sentries, prioritize killing an outside Sentry and use AoE attacks over passive block when HP allows.",
+                "Against Act 2 high-threat enemies, value fast kills, AoE into minions/slavers, and premium mitigation like Disarm or Weak.",
                 "Do not take speculative synergy cards unless the current deck already supports them.",
+                "Blessing of the Forge is not a defensive potion by itself; use it only before spending energy on cards that benefit this turn.",
                 "Use potions for lethal, elite/boss danger, or to prevent a large HP loss; do not waste them on easy turns.",
                 "Use the fallback action if it is clearly reasonable and no better legal action exists.",
             ],
@@ -939,9 +1187,28 @@ def model_command_is_lethal_attack(command: str, combat: dict[str, Any]) -> bool
     monster = combat_monster_at(combat, play[1])
     if card is None or monster is None or not card.get("has_target"):
         return False
-    damage = estimate_card_damage(card)
+    player = combat.get("player") or {}
+    damage = estimate_card_damage_against(card, monster, player)
     hp_with_block = int(monster.get("current_hp") or 0) + int(monster.get("block") or 0)
     return damage > 0 and damage >= hp_with_block
+
+
+def model_command_starts_turn_lethal(command: str, combat: dict[str, Any]) -> bool:
+    play = parse_play_command(command)
+    if play is None or play[1] is None:
+        return False
+    hand = combat.get("hand") or []
+    player = combat.get("player") or {}
+    monster = combat_monster_at(combat, play[1])
+    card = combat_card_at(combat, play[0])
+    if monster is None or card is None or not card.get("has_target"):
+        return False
+    if str(card.get("type") or "").upper() != "ATTACK":
+        return False
+    energy = int(player.get("energy") or 0)
+    target_hp = monster_hp_with_block(monster)
+    sequence = turn_lethal_attack_sequence(hand, energy, target_hp, requires_target=True, target=monster, player=player)
+    return bool(sequence and play[0] in sequence)
 
 
 def model_command_attack_damage(command: str, combat: dict[str, Any]) -> int:
@@ -951,7 +1218,9 @@ def model_command_attack_damage(command: str, combat: dict[str, Any]) -> int:
     card = combat_card_at(combat, play[0])
     if card is None or not card.get("has_target"):
         return 0
-    return estimate_card_damage(card)
+    monster = combat_monster_at(combat, play[1])
+    player = combat.get("player") or {}
+    return estimate_card_damage_against(card, monster, player)
 
 
 def parse_play_command(command: str) -> tuple[int, int | None] | None:
@@ -1106,6 +1375,8 @@ def add_potion_actions(
     for slot, potion in enumerate(potions):
         if not isinstance(potion, dict) or not potion.get("can_use"):
             continue
+        if not should_offer_potion_action(potion, state, combat):
+            continue
         potion_name = str(potion.get("name") or potion.get("id") or "Potion")
         if is_smoke_bomb(potion):
             actions.append(
@@ -1129,9 +1400,38 @@ def add_potion_actions(
                 LegalAction(
                     f"potion_use_{slot}",
                     f"POTION Use {slot}",
-                    f"Use {potion_name}. Save potions unless this prevents major damage, creates lethal, or handles an elite/boss danger.",
+                    potion_action_description(potion_name),
                 )
             )
+
+
+def should_offer_potion_action(potion: dict[str, Any], state: dict[str, Any], combat: dict[str, Any]) -> bool:
+    name = normalize_name(str(potion.get("name") or potion.get("id") or ""))
+    if "blessing of the forge" in name:
+        return forge_potion_has_immediate_value(combat)
+    if "fruit juice" in name:
+        return True
+    return True
+
+
+def forge_potion_has_immediate_value(combat: dict[str, Any]) -> bool:
+    player = combat.get("player") or {}
+    energy = int(player.get("energy") or 0)
+    if energy <= 0:
+        return False
+    hand = combat.get("hand") or []
+    playable = [card for card in hand if isinstance(card, dict) and is_playable(card, energy)]
+    return any(
+        str(card.get("type") or "").upper() in {"ATTACK", "SKILL"}
+        and normalize_card_name(card) not in {"Anger"}
+        for card in playable
+    )
+
+
+def potion_action_description(potion_name: str) -> str:
+    if normalize_name(potion_name) == "blessing of the forge":
+        return "Use Blessing of the Forge only before playing upgraded cards this turn; it does not block damage by itself."
+    return f"Use {potion_name}. Save potions unless this prevents major damage, creates lethal, or handles an elite/boss danger."
 
 
 def choose_potion_command(state: dict[str, Any], available: set[str]) -> str | None:
@@ -1162,12 +1462,20 @@ def choose_potion_command(state: dict[str, Any], available: set[str]) -> str | N
     for slot, potion in enumerate(potions):
         if not isinstance(potion, dict) or not potion.get("can_use"):
             continue
+        if not should_offer_potion_action(potion, state, combat):
+            continue
         name = normalize_name(str(potion.get("name") or potion.get("id") or ""))
         if "fire" in name:
             target = potion_damage_lethal_target(live_monsters, 20)
             if target is not None:
                 return f"POTION Use {slot} {target}"
-        if "explosive" in name and potion_damage_kills_any(live_monsters, 10):
+            target = potion_damage_good_target(live_monsters, 20)
+            if target is not None and (is_dangerous_room or damage_gap >= 14):
+                return f"POTION Use {slot} {target}"
+        if "explosive" in name and (
+            potion_damage_kills_any(live_monsters, 10)
+            or (is_dangerous_room and len(live_monsters) >= 2 and damage_gap >= 8)
+        ):
             return f"POTION Use {slot}"
 
     if damage_gap < 12 and current_hp > damage_gap + 12 and not is_dangerous_room:
@@ -1192,7 +1500,11 @@ def choose_potion_command(state: dict[str, Any], available: set[str]) -> str | N
             return f"POTION Use {slot}"
         if "weak" in name:
             target = highest_incoming_monster(live_monsters)
-            if target is not None and damage_gap >= 10:
+            if (
+                target is not None
+                and damage_gap >= 14
+                and (is_dangerous_room or current_hp <= damage_gap + 24 or int(state.get("act") or 1) >= 2)
+            ):
                 return f"POTION Use {slot} {target}"
         if "smoke bomb" in name and should_use_smoke_bomb(state, damage_gap, current_hp, is_dangerous_room):
             return f"POTION Use {slot}"
@@ -1293,6 +1605,17 @@ def potion_damage_kills_any(live_monsters: list[tuple[int, dict[str, Any]]], dam
     return any(int(monster.get("current_hp") or 0) + int(monster.get("block") or 0) <= damage for _, monster in live_monsters)
 
 
+def potion_damage_good_target(live_monsters: list[tuple[int, dict[str, Any]]], damage: int) -> int | None:
+    candidates: list[tuple[int, int]] = []
+    for index, monster in live_monsters:
+        hp_with_block = int(monster.get("current_hp") or 0) + int(monster.get("block") or 0)
+        if hp_with_block <= damage + 12:
+            candidates.append((monster_incoming_damage(monster) * 3 - hp_with_block, index))
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
 def highest_incoming_monster(live_monsters: list[tuple[int, dict[str, Any]]]) -> int | None:
     candidates = [(monster_incoming_damage(monster), index) for index, monster in live_monsters]
     if not candidates:
@@ -1360,7 +1683,7 @@ def add_card_reward_actions(
                     f"Take {reward_kind} {index}: {describe_card(card)}; heuristic score {score}.",
                 )
             )
-    if "skip" in available:
+    if "skip" in available and state.get("combat_state"):
         actions.append(LegalAction("skip_reward", "SKIP", "Skip this card reward."))
 
 
@@ -1732,9 +2055,26 @@ def monster_incoming_damage(monster: dict[str, Any]) -> int:
     return damage * max(hits, 1)
 
 
-def choose_target(monsters: list[dict[str, Any]]) -> int | None:
+def live_combat_monsters(monsters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        monster
+        for monster in monsters
+        if not monster.get("is_gone") and not monster.get("half_dead") and int(monster.get("current_hp") or 0) > 0
+    ]
+
+
+def monster_hp_with_block(monster: dict[str, Any]) -> int:
+    return int(monster.get("current_hp") or 0) + int(monster.get("block") or 0)
+
+
+def monster_name(monster: dict[str, Any]) -> str:
+    return normalize_name(str(monster.get("name") or monster.get("id") or ""))
+
+
+def choose_target(monsters: list[dict[str, Any]], state: dict[str, Any] | None = None) -> int | None:
     candidates: list[tuple[int, int, int]] = []
     sentries = is_sentries_monster_list(monsters)
+    gremlin_leader = any("gremlin leader" in monster_name(monster) for monster in monsters)
     for index, monster in enumerate(monsters):
         if monster.get("is_gone") or monster.get("half_dead"):
             continue
@@ -1742,18 +2082,41 @@ def choose_target(monsters: list[dict[str, Any]]) -> int | None:
         if hp > 0:
             incoming = monster_incoming_damage(monster)
             score = incoming * 4 - hp
+            name = monster_name(monster)
             if "MINION" in str(monster.get("type") or "").upper():
-                score += 12
+                score += 28 if gremlin_leader and incoming > 0 else 12
             if sentries and index != 1:
+                score += 26
+            if "red slaver" in name:
+                score += 34
+            elif "taskmaster" in name:
+                score += 24
+            elif "blue slaver" in name:
                 score += 18
+            elif "gremlin leader" in name and live_minion_count(monsters) >= 2 and incoming <= 0:
+                score -= 35
+            elif "book of stabbing" in name or "snake plant" in name:
+                score += 20
+            elif "spheric guardian" in name:
+                score += 12
             candidates.append((score, -hp, index))
     if not candidates:
         return None
     return max(candidates)[2]
 
 
+def live_minion_count(monsters: list[dict[str, Any]]) -> int:
+    total = 0
+    for monster in monsters:
+        if monster.get("is_gone") or monster.get("half_dead") or int(monster.get("current_hp") or 0) <= 0:
+            continue
+        if "MINION" in str(monster.get("type") or "").upper():
+            total += 1
+    return total
+
+
 def is_sentries_monster_list(monsters: list[dict[str, Any]]) -> bool:
-    names = [normalize_name(str(monster.get("name") or monster.get("id") or "")) for monster in monsters]
+    names = [monster_name(monster) for monster in monsters]
     return len(names) >= 3 and sum(1 for name in names if "sentry" in name) >= 3
 
 
@@ -1779,6 +2142,10 @@ def best_targeted_utility_card(
             if monster.get("is_gone") or monster.get("half_dead") or int(monster.get("current_hp") or 0) <= 0:
                 continue
             score = utility_score + monster_incoming_damage(monster) * 2 + int(monster.get("current_hp") or 0) // 5
+            if monster_has_artifact(monster):
+                score -= 45
+            if is_high_threat_monster(monster):
+                score += 18
             candidates.append((score, card_index, monster_index))
     if not candidates:
         return None
@@ -1788,12 +2155,31 @@ def best_targeted_utility_card(
 
 def targeted_utility_score(card_name: str, state: dict[str, Any], damage_gap: int, dangerous: bool) -> int:
     if card_name == "Disarm":
+        if is_gremlin_nob_fight(state):
+            return 0
         if is_lagavulin_fight(state) and lagavulin_is_sleeping(state):
             return 0
+        if is_lagavulin_fight(state) and lagavulin_is_debuffing(state):
+            return 0
+        if is_book_of_stabbing_fight(state) or is_snake_plant_fight(state):
+            return 120
+        if is_lagavulin_fight(state) and not lagavulin_is_debuffing(state):
+            return 105
         if dangerous or damage_gap >= 8 or int(state.get("act") or 1) >= 2:
             return 92
         return 45
     return 0
+
+
+def monster_has_artifact(monster: dict[str, Any]) -> bool:
+    for power in monster.get("powers") or []:
+        if not isinstance(power, dict):
+            continue
+        name = normalize_name(str(power.get("name") or power.get("id") or ""))
+        amount = int(power.get("amount") or 0)
+        if amount > 0 and ("artifact" in name or name == "artifact"):
+            return True
+    return False
 
 
 def best_card(
@@ -1823,17 +2209,18 @@ def choose_lethal_attack(
     hand: list[dict[str, Any]],
     monsters: list[dict[str, Any]],
     energy: int,
+    player: dict[str, Any] | None = None,
 ) -> tuple[int, int] | None:
     candidates: list[tuple[int, int, int]] = []
     for card_index, card in enumerate(hand):
         if not is_playable(card, energy) or not card.get("has_target"):
             continue
-        damage = estimate_card_damage(card)
-        if damage <= 0:
-            continue
         cost = effective_card_cost(card)
         for monster_index, monster in enumerate(monsters):
             if monster.get("is_gone") or monster.get("half_dead"):
+                continue
+            damage = estimate_card_damage_against(card, monster, player)
+            if damage <= 0:
                 continue
             hp = int(monster.get("current_hp") or 0)
             block = int(monster.get("block") or 0)
@@ -1844,6 +2231,117 @@ def choose_lethal_attack(
         return None
     _, _, card_index, monster_index = max(candidates)
     return card_index, monster_index
+
+
+def choose_turn_lethal_attack(
+    hand: list[dict[str, Any]],
+    monsters: list[dict[str, Any]],
+    energy: int,
+    player: dict[str, Any] | None = None,
+) -> tuple[int, int] | None:
+    candidates: list[tuple[int, int, int, int, int]] = []
+    for monster_index, monster in enumerate(monsters):
+        if monster.get("is_gone") or monster.get("half_dead"):
+            continue
+        target_hp = monster_hp_with_block(monster)
+        if target_hp <= 0:
+            continue
+        sequence = turn_lethal_attack_sequence(hand, energy, target_hp, requires_target=True, target=monster, player=player)
+        if not sequence:
+            continue
+        first_index = sequence[0]
+        total_damage = sum(estimate_card_damage_against(hand[index], monster, player) for index in sequence)
+        total_cost = sum(effective_card_cost(hand[index]) for index in sequence)
+        incoming = monster_incoming_damage(monster)
+        candidates.append((incoming, -total_cost, -len(sequence), total_damage, first_index, monster_index))
+    if not candidates:
+        return None
+    _, _, _, _, card_index, monster_index = max(candidates)
+    return card_index, monster_index
+
+
+def turn_lethal_attack_sequence(
+    hand: list[dict[str, Any]],
+    energy: int,
+    target_hp: int,
+    *,
+    requires_target: bool,
+    target: dict[str, Any] | None = None,
+    player: dict[str, Any] | None = None,
+) -> list[int] | None:
+    attacks: list[tuple[int, int, int, int]] = []
+    for index, card in enumerate(hand):
+        if not is_playable(card, energy):
+            continue
+        if bool(card.get("has_target")) != requires_target:
+            continue
+        if str(card.get("type") or "").upper() != "ATTACK":
+            continue
+        damage = estimate_card_damage_against(card, target, player)
+        if damage <= 0:
+            continue
+        cost = effective_card_cost(card)
+        if cost > energy:
+            continue
+        attacks.append((index, cost, damage, attack_sequence_card_score(card, damage, cost)))
+
+    if not attacks:
+        return None
+
+    best: tuple[int, int, int, int, list[int]] | None = None
+
+    def visit(position: int, remaining_energy: int, total_damage: int, total_cost: int, sequence: list[int]) -> None:
+        nonlocal best
+        if sequence and total_damage >= target_hp:
+            ordered = order_attack_sequence(sequence, hand)
+            score = (
+                -total_cost,
+                -len(sequence),
+                total_damage,
+                attack_sequence_card_score(
+                    hand[ordered[0]],
+                    estimate_card_damage_against(hand[ordered[0]], target, player),
+                    effective_card_cost(hand[ordered[0]]),
+                ),
+                ordered,
+            )
+            if best is None or score[:4] > best[:4]:
+                best = score
+            return
+        if position >= len(attacks):
+            return
+        for next_position in range(position, len(attacks)):
+            index, cost, damage, _ = attacks[next_position]
+            if cost > remaining_energy:
+                continue
+            visit(next_position + 1, remaining_energy - cost, total_damage + damage, total_cost + cost, sequence + [index])
+
+    visit(0, energy, 0, 0, [])
+    if best is None:
+        return None
+    return best[4]
+
+
+def order_attack_sequence(sequence: list[int], hand: list[dict[str, Any]]) -> list[int]:
+    return sorted(
+        sequence,
+        key=lambda index: (
+            -attack_sequence_card_score(hand[index], estimate_card_damage(hand[index]), effective_card_cost(hand[index])),
+            index,
+        ),
+    )
+
+
+def attack_sequence_card_score(card: dict[str, Any], damage: int, cost: int) -> int:
+    name = normalize_card_name(card)
+    score = damage * 10 - max(cost, 0) * 4
+    if name in {"Pommel Strike", "Twin Strike", "Pummel"}:
+        score += 10
+    if name in {"Bash", "Uppercut", "Clothesline", "Shockwave"}:
+        score += 6
+    if cost == 0:
+        score += 8
+    return score
 
 
 def best_attack_card(hand: list[dict[str, Any]], energy: int, target: dict[str, Any]) -> int | None:
@@ -1863,6 +2361,68 @@ def best_attack_card(hand: list[dict[str, Any]], energy: int, target: dict[str, 
     if not candidates:
         return None
     return max(candidates, key=lambda candidate: (candidate[0], -candidate[1]))[1]
+
+
+def best_untargeted_attack_card(
+    hand: list[dict[str, Any]],
+    energy: int,
+    monsters: list[dict[str, Any]],
+    state: dict[str, Any],
+) -> int | None:
+    live_monsters = live_combat_monsters(monsters)
+    if not live_monsters:
+        return None
+    candidates: list[tuple[int, int]] = []
+    multi_enemy = len(live_monsters) >= 2
+    for index, card in enumerate(hand):
+        if not is_playable(card, energy) or card.get("has_target"):
+            continue
+        if str(card.get("type") or "").upper() != "ATTACK":
+            continue
+        damage = estimate_card_damage(card)
+        if damage <= 0:
+            continue
+        total_effective_damage = sum(min(damage, monster_hp_with_block(monster)) for monster in live_monsters)
+        kills = sum(1 for monster in live_monsters if damage >= monster_hp_with_block(monster))
+        name = normalize_card_name(card)
+        if not multi_enemy and kills == 0 and name not in {"Immolate", "Whirlwind"}:
+            continue
+        cost = max(effective_card_cost(card), 1)
+        score = total_effective_damage * 8 // cost + kills * 45
+        if multi_enemy:
+            score += 35
+        if name in {"Immolate", "Whirlwind", "Cleave"}:
+            score += 24
+        if is_sentries_fight(state):
+            score += 30
+        if is_act2_high_threat_fight(state) and multi_enemy:
+            score += 28
+        candidates.append((score, index))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: (candidate[0], -candidate[1]))[1]
+
+
+def should_untargeted_attack_over_block(
+    card: dict[str, Any],
+    monsters: list[dict[str, Any]],
+    incoming: int,
+    current_block: int,
+    current_hp: int,
+    state: dict[str, Any],
+) -> bool:
+    damage_gap = max(incoming - current_block, 0)
+    if damage_gap <= 0:
+        return True
+    live_monsters = live_combat_monsters(monsters)
+    damage = estimate_card_damage(card)
+    if any(damage >= monster_hp_with_block(monster) and monster_incoming_damage(monster) > 0 for monster in live_monsters):
+        return True
+    if is_sentries_fight(state):
+        return damage_gap <= 12 and current_hp > damage_gap + 20
+    if is_act2_high_threat_fight(state) and len(live_monsters) >= 2:
+        return damage_gap <= 14 and current_hp > damage_gap + 18
+    return damage_gap <= 8 and current_hp > damage_gap + 18
 
 
 def best_block_card(hand: list[dict[str, Any]], energy: int) -> int | None:
@@ -1895,6 +2455,50 @@ def estimate_card_damage(card: dict[str, Any]) -> int:
     if not base and str(card.get("type") or "").upper() == "ATTACK":
         base = 6
     return base
+
+
+def estimate_card_damage_against(
+    card: dict[str, Any],
+    monster: dict[str, Any] | None = None,
+    player: dict[str, Any] | None = None,
+) -> int:
+    damage = estimate_card_damage(card)
+    if damage <= 0:
+        return 0
+    strength = power_amount((player or {}).get("powers") or [], {"strength"})
+    if strength:
+        damage += strength * max(card_hit_count(card), 1)
+    if has_power(monster, {"vulnerable"}):
+        damage = damage * 3 // 2
+    if has_power(player, {"weak"}):
+        damage = damage * 3 // 4
+    return max(damage, 0)
+
+
+def card_hit_count(card: dict[str, Any]) -> int:
+    name = normalize_card_name(card)
+    if name in {"Twin Strike", "Pummel", "Sword Boomerang"}:
+        return 2 if name == "Twin Strike" else 4
+    return 1
+
+
+def has_power(owner: dict[str, Any] | None, names: set[str]) -> bool:
+    if not isinstance(owner, dict):
+        return False
+    return power_amount(owner.get("powers") or [], names) != 0
+
+
+def power_amount(powers: list[Any], names: set[str]) -> int:
+    for power in powers:
+        if not isinstance(power, dict):
+            continue
+        name = normalize_name(str(power.get("name") or power.get("id") or ""))
+        if name in names:
+            try:
+                return int(power.get("amount") or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def estimate_card_block(card: dict[str, Any]) -> int:
@@ -2017,10 +2621,12 @@ def choose_card_reward_command(state: dict[str, Any], screen_state: dict[str, An
             index = choose_card_reward_index(cards, state)
         if index is not None:
             score = combat_generated_card_score(cards[index], state) if state.get("combat_state") else card_reward_score(cards[index], state)
+            if not state.get("combat_state"):
+                return f"CHOOSE {index}"
             if score >= 55 or "skip" not in available:
                 return f"CHOOSE {index}"
 
-    if "skip" in available:
+    if "skip" in available and state.get("combat_state"):
         return "SKIP"
     if "return" in available:
         return "RETURN"
@@ -2247,12 +2853,17 @@ def has_empty_potion_slot(state: dict[str, Any]) -> bool:
 
 
 def choose_map_command(state: dict[str, Any], screen_state: dict[str, Any], available: set[str]) -> str:
+    global LAST_CHOSEN_MAP_NODE
     if "choose" in available:
         nodes = screen_state.get("next_nodes") or []
         if isinstance(nodes, list) and nodes:
             scores = [(map_node_score(node, state), index) for index, node in enumerate(nodes) if isinstance(node, dict)]
             if scores:
-                return f"CHOOSE {max(scores, key=lambda item: (item[0], -item[1]))[1]}"
+                index = max(scores, key=lambda item: (item[0], -item[1]))[1]
+                if isinstance(nodes[index], dict):
+                    LAST_CHOSEN_MAP_NODE = dict(nodes[index])
+                return f"CHOOSE {index}"
+        LAST_CHOSEN_MAP_NODE = None
         return "CHOOSE 0"
 
     if "proceed" in available:
@@ -2270,6 +2881,7 @@ def map_node_score(node: dict[str, Any], state: dict[str, Any]) -> int:
     current_hp = int(state.get("current_hp") or 0)
     max_hp = int(state.get("max_hp") or 1)
     hp_ratio = current_hp / max(max_hp, 1)
+    act = int(state.get("act") or 1)
     gold = int(state.get("gold") or 0)
     deck = state.get("deck") or []
     deck_size = len(deck) if isinstance(deck, list) else 0
@@ -2289,17 +2901,25 @@ def map_node_score(node: dict[str, Any], state: dict[str, Any]) -> int:
         if gold < 75:
             score -= 30
     if symbol == "E":
-        if hp_ratio >= 0.72 and (deck_size >= 12 or upgraded_bash):
+        elite_hp_threshold = 0.82 if act >= 2 else 0.80
+        low_hp_threshold = 0.76 if act >= 2 else 0.74
+        if hp_ratio >= elite_hp_threshold and (deck_size >= 12 or upgraded_bash):
             score += 35
-        elif hp_ratio < 0.65:
-            score -= 55
         elif hp_ratio < 0.55:
+            score -= 70
+        elif hp_ratio < low_hp_threshold:
+            score -= 55
+        elif hp_ratio < elite_hp_threshold:
             score -= 30
+        if act >= 2:
+            score -= 18
     if symbol == "R":
         if hp_ratio < 0.5:
-            score += 40
+            score += 55
         elif hp_ratio < 0.65:
-            score += 25
+            score += 45
+        elif hp_ratio < 0.8:
+            score += 35
     score += route_lookahead_score(node, state, hp_ratio, gold, depth=5)
     return score
 
@@ -2414,9 +3034,12 @@ def rest_option_score(option: str, state: dict[str, Any]) -> int:
     max_hp = int(state.get("max_hp") or 1)
     hp_ratio = current_hp / max(max_hp, 1)
     key = normalize_name(option)
+    forced_elite_soon = forced_route_symbol_within(state, {"E", "B"}, depth=2)
     if key == "rest":
         if hp_ratio <= 0.55:
             return 120
+        if hp_ratio < 0.78 and forced_elite_soon:
+            return 112
         if hp_ratio < 0.68 and next_known_node_is_boss_or_elite(state):
             return 105
         if hp_ratio < 0.65:
@@ -2425,6 +3048,8 @@ def rest_option_score(option: str, state: dict[str, Any]) -> int:
     if key == "smith":
         if hp_ratio <= 0.55:
             return 35
+        if hp_ratio < 0.78 and forced_elite_soon:
+            return 60
         if hp_ratio < 0.65:
             return 75
         return 100
@@ -2442,6 +3067,51 @@ def next_known_node_is_boss_or_elite(state: dict[str, Any]) -> bool:
         if isinstance(node, dict) and str(node.get("symbol") or "") in {"E", "B"}:
             return True
     return False
+
+
+def forced_route_symbol_within(state: dict[str, Any], symbols: set[str], depth: int) -> bool:
+    node = LAST_CHOSEN_MAP_NODE
+    if not isinstance(node, dict):
+        return False
+    full_map = state.get("map") or []
+    if not isinstance(full_map, list):
+        return False
+    by_position = {
+        (int(item.get("x")), int(item.get("y"))): item
+        for item in full_map
+        if isinstance(item, dict) and item.get("x") is not None and item.get("y") is not None
+    }
+    node_pos = child_position(node)
+    if node_pos is not None and node_pos in by_position:
+        node = by_position[node_pos]
+    return forced_route_symbol_from_node(node, by_position, symbols, depth)
+
+
+def forced_route_symbol_from_node(
+    node: dict[str, Any],
+    by_position: dict[tuple[int, int], dict[str, Any]],
+    symbols: set[str],
+    depth: int,
+) -> bool:
+    if depth <= 0:
+        return False
+    children = node.get("children") or []
+    if not isinstance(children, list) or not children:
+        return False
+    branch_results = []
+    for child in children:
+        if not isinstance(child, dict):
+            continue
+        child_pos = child_position(child)
+        child_node = by_position.get(child_pos) if child_pos is not None else None
+        if child_node is None:
+            branch_results.append(False)
+            continue
+        if str(child_node.get("symbol") or "") in symbols:
+            branch_results.append(True)
+            continue
+        branch_results.append(forced_route_symbol_from_node(child_node, by_position, symbols, depth - 1))
+    return bool(branch_results) and all(branch_results)
 
 
 def choose_event_command(state: dict[str, Any], screen_state: dict[str, Any], available: set[str]) -> str:
@@ -2569,6 +3239,9 @@ def card_reward_score(card: dict[str, Any], state: dict[str, Any] | None = None)
     deck = (state or {}).get("deck") or []
     act = int((state or {}).get("act") or 1)
     floor = int((state or {}).get("floor") or 0)
+    defense_count = count_block_cards(deck)
+    non_basic_attacks = count_non_basic_attacks(deck)
+    draw_count = count_draw_cards(deck)
 
     score = CARD_REWARD_PRIORITY.get(card_id, CARD_REWARD_PRIORITY.get(name, 0))
     if not score:
@@ -2588,6 +3261,19 @@ def card_reward_score(card: dict[str, Any], state: dict[str, Any] | None = None)
             score -= 22
         if card_type == "POWER" and count_non_basic_attacks(deck) < 2:
             score -= 8
+    if act >= 2:
+        if normalized in {"Disarm", "Shockwave", "Impervious", "Flame Barrier", "Power Through", "Shrug It Off"}:
+            score += 18
+        if normalized in {"Battle Trance", "Pommel Strike", "Burning Pact", "Offering"}:
+            score += 14
+        if card_type == "ATTACK" and non_basic_attacks >= 6 and normalized not in {"Immolate", "Feed", "Reaper", "Fiend Fire"}:
+            score -= 12
+        if card_type == "SKILL" and estimate_card_block(card) > 0 and defense_count < 5:
+            score += 16
+        if draw_count < 2 and normalized in {"Battle Trance", "Pommel Strike", "Burning Pact", "Shrug It Off"}:
+            score += 10
+        if normalized in SPECULATIVE_SYNERGY_CARDS and not deck_supports_synergy(normalized, deck):
+            score -= 12
     if normalized == "Clash" and deck_has_many_non_attacks(deck):
         score -= 28
     if normalized == "Sword Boomerang" and not deck_has_strength_scaling(deck):
@@ -2596,6 +3282,14 @@ def card_reward_score(card: dict[str, Any], state: dict[str, Any] | None = None)
         score -= 18
     if normalized == "Body Slam" and count_block_cards(deck) < 5:
         score -= 20
+    if normalized == "Limit Break" and not deck_has_strength_scaling(deck):
+        score -= 35
+    if normalized == "Corruption" and not deck_has_exhaust_support(deck):
+        score -= 30 if act == 1 and floor <= 8 else 18
+    if normalized in {"Barricade", "Entrench"} and count_block_cards(deck) < 6:
+        score -= 30
+    if normalized == "Juggernaut" and count_block_cards(deck) < 6:
+        score -= 24
     return score
 
 
@@ -2634,6 +3328,11 @@ def count_block_cards(deck: list[Any]) -> int:
         if estimate_card_block(card) > 0:
             total += 1
     return total
+
+
+def count_draw_cards(deck: list[Any]) -> int:
+    draw_cards = {"Battle Trance", "Burning Pact", "Offering", "Pommel Strike", "Shrug It Off"}
+    return sum(1 for card in deck if isinstance(card, dict) and normalize_card_name(card) in draw_cards)
 
 
 def deck_has_strength_scaling(deck: list[Any]) -> bool:
@@ -2710,14 +3409,9 @@ def choose_shop_choice_index(state: dict[str, Any], screen_state: dict[str, Any]
 
     shop_items = collect_shop_items(screen_state)
     for index, choice in enumerate(choices):
-        key = normalize_name(choice)
-        item = shop_items.get(key)
-        if item is None:
+        score = shop_choice_score(state, screen_state, choice)
+        if score is None:
             continue
-        price = int(item.get("price") or 0)
-        if price <= 0 or price > gold:
-            continue
-        score = shop_item_score(item) - price // 5
         if score >= 60:
             candidates.append((score, index))
 
@@ -2731,18 +3425,81 @@ def collect_shop_items(screen_state: dict[str, Any]) -> dict[str, dict[str, Any]
     for group in ("cards", "relics", "potions"):
         for item in screen_state.get(group) or []:
             if isinstance(item, dict):
-                items[normalize_name(str(item.get("name") or item.get("id") or ""))] = item
+                item_copy = dict(item)
+                item_copy["_shop_group"] = group
+                items[normalize_name(str(item_copy.get("name") or item_copy.get("id") or ""))] = item_copy
     return items
 
 
-def shop_item_score(item: dict[str, Any]) -> int:
+def shop_choice_score(state: dict[str, Any], screen_state: dict[str, Any], choice: str) -> int | None:
+    gold = int(state.get("gold") or 0)
+    item = collect_shop_items(screen_state).get(normalize_name(choice))
+    if item is None:
+        return None
+    price = int(item.get("price") or 0)
+    if price <= 0 or price > gold:
+        return None
+    return shop_item_score(item, state) - price // shop_price_divisor(item)
+
+
+def shop_item_score(item: dict[str, Any], state: dict[str, Any] | None = None) -> int:
     name = str(item.get("name") or item.get("id") or "")
     score = SHOP_CARD_PRIORITY.get(name, SHOP_CARD_PRIORITY.get(str(item.get("id") or ""), 0))
     if score:
         return score
+    group = str(item.get("_shop_group") or "")
     if "rarity" in item or "type" in item:
-        return card_reward_score(item)
+        return card_reward_score(item, state) + 6
+    if group == "potions":
+        return potion_value(item)
+    if group == "relics":
+        return relic_shop_score(item, state)
     return 50
+
+
+def shop_price_divisor(item: dict[str, Any]) -> int:
+    group = str(item.get("_shop_group") or "")
+    if group == "relics":
+        return 10
+    if group == "cards":
+        return 7
+    if group == "potions":
+        return 4
+    return 6
+
+
+def relic_shop_score(item: dict[str, Any], state: dict[str, Any] | None = None) -> int:
+    name = str(item.get("name") or item.get("id") or "")
+    known = {
+        "Bag of Preparation": 105,
+        "Blood Vial": 80,
+        "Bottled Flame": 78,
+        "Bottled Lightning": 82,
+        "Chemical X": 115,
+        "Clockwork Souvenir": 92,
+        "Data Disk": 85,
+        "Frozen Eye": 88,
+        "Happy Flower": 92,
+        "Kunai": 112,
+        "Lantern": 92,
+        "Letter Opener": 76,
+        "Membership Card": 125,
+        "Molten Egg 2": 105,
+        "Oddly Smooth Stone": 92,
+        "Orichalcum": 84,
+        "Paper Frog": 118,
+        "Pen Nib": 120,
+        "Pocketwatch": 98,
+        "PreservedInsect": 105,
+        "Shuriken": 112,
+        "Singing Bowl": 78,
+        "Toxic Egg 2": 96,
+        "Vajra": 98,
+    }
+    score = known.get(name, known.get(str(item.get("id") or ""), 82))
+    if int((state or {}).get("act") or 1) >= 2 and name in {"PreservedInsect", "Paper Frog"}:
+        score += 8
+    return score
 
 
 def deck_has_low_value_removal_target(deck: list[Any]) -> bool:
@@ -2822,6 +3579,20 @@ def grid_card_score(card: dict[str, Any], screen_state: dict[str, Any]) -> int:
         return 10
 
     if screen_state.get("for_upgrade"):
+        upgrade_priorities = {
+            "Bludgeon": 125,
+            "Inflame": 118,
+            "Bash": 112,
+            "Shockwave": 108,
+            "Pommel Strike": 92,
+            "Shrug It Off": 88,
+            "Headbutt": 84,
+            "Twin Strike": 78,
+            "Anger": 70,
+        }
+        normalized = normalize_card_name(card)
+        if normalized in upgrade_priorities:
+            return upgrade_priorities[normalized] - upgrades * 8
         if card_id == "Bash" or name == "Bash":
             return 100 - upgrades
         if card_type == "ATTACK":
@@ -2859,9 +3630,11 @@ def quote_choice(choice: str) -> str:
 
 def run_protocol(options: Options) -> int:
     setup_logging()
-    logging.info("AI process started")
+    process_id = os.getpid()
+    logging.info("AI process started pid=%s", process_id)
     print("ready", flush=True)
 
+    state_index = 0
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2873,11 +3646,15 @@ def run_protocol(options: Options) -> int:
             logging.exception("Invalid JSON from CommunicationMod")
             command = "STATE"
         else:
+            state_index += 1
+            payload["_sts_ai_log_index"] = state_index
+            payload["_sts_ai_process_id"] = process_id
+            payload["_sts_ai_received_at"] = time.time()
             append_jsonl("states.jsonl", payload)
             command = choose_command(payload, options)
             remember_potion_use(command, payload)
 
-        action = {"time": time.time(), "command": command}
+        action = {"time": time.time(), "state_index": state_index, "process_id": process_id, "command": command}
         append_jsonl("actions.jsonl", action)
         logging.info("command=%s", command)
         print(command, flush=True)
@@ -2935,6 +3712,8 @@ def run_test(
         character="IRONCLAD",
         ascension=0,
         seed=None,
+        stop_on_game_over=False,
+        max_floor=None,
         use_openai_api=use_openai_api,
         openai_model=openai_model,
         openai_api_base=openai_api_base,
@@ -2944,8 +3723,18 @@ def run_test(
         codex_command=codex_command or default_codex_command(),
         codex_timeout=codex_timeout,
     )
-    command = choose_command(sample, options)
+    try:
+        command = choose_command(sample, options)
+    except Exception as error:
+        if use_openai_api:
+            print(f"OpenAI API error: {error}", file=sys.stderr)
+            return 2
+        raise
     print(command)
+    if use_openai_api:
+        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("STS_AI_OPENAI_API_KEY")
+        if not api_key or OPENAI_API_DISABLED_REASON or OPENAI_API_LAST_ERROR:
+            return 2
     return 0 if command == "PLAY 1" else 1
 
 
@@ -2955,7 +3744,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--auto-start", action="store_true", help="Start a new run from the main menu.")
     parser.add_argument("--character", default="IRONCLAD", help="Character for START command.")
     parser.add_argument("--ascension", type=int, default=0, help="Ascension level for START command.")
-    parser.add_argument("--seed", default=None, help="Optional seed for START command.")
+    parser.add_argument("--seed", default=None, help="Optional user-facing seed string for START command.")
+    parser.add_argument("--seed-long", default=None, help="Optional numeric game_state.seed value converted to a user-facing seed.")
+    parser.add_argument("--stop-on-game-over", action="store_true", help="Pause instead of starting another run after death.")
+    parser.add_argument("--max-floor", type=int, default=None, help="Pause once this floor or later is reached.")
     parser.add_argument("--use-openai-api", action="store_true", help="Ask the OpenAI Responses API to choose from legal actions.")
     parser.add_argument(
         "--openai-model",
@@ -3006,11 +3798,18 @@ def main(argv: list[str] | None = None) -> int:
             codex_command=args.codex_command,
             codex_timeout=args.codex_timeout,
         )
+    try:
+        start_seed = normalize_start_seed(args.seed, args.seed_long)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     options = Options(
         auto_start=args.auto_start,
         character=args.character,
         ascension=args.ascension,
-        seed=args.seed,
+        seed=start_seed,
+        stop_on_game_over=args.stop_on_game_over,
+        max_floor=args.max_floor,
         use_openai_api=args.use_openai_api,
         openai_model=args.openai_model,
         openai_api_base=args.openai_api_base,

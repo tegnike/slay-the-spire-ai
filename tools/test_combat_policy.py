@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Focused tests for combat helper policy logic."""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import sts_ai_player
+
+
+def attack(name: str, damage_id: str | None = None, cost: int = 1, upgrades: int = 0) -> dict:
+    return {
+        "id": damage_id or name,
+        "name": name,
+        "type": "ATTACK",
+        "cost": cost,
+        "upgrades": upgrades,
+        "is_playable": True,
+        "has_target": True,
+    }
+
+
+def skill(name: str, block_id: str | None = None, cost: int = 1, upgrades: int = 0) -> dict:
+    return {
+        "id": block_id or name,
+        "name": name,
+        "type": "SKILL",
+        "cost": cost,
+        "upgrades": upgrades,
+        "is_playable": True,
+        "has_target": False,
+    }
+
+
+class CombatPolicyTests(unittest.TestCase):
+    def test_estimate_card_damage_uses_known_base_and_upgrade_rules(self):
+        self.assertEqual(sts_ai_player.estimate_card_damage(attack("Strike", "Strike_R")), 6)
+        self.assertEqual(sts_ai_player.estimate_card_damage(attack("Bash+", "Bash", upgrades=1)), 10)
+        self.assertEqual(sts_ai_player.estimate_card_damage(attack("Pommel Strike", upgrades=1)), 12)
+        self.assertEqual(sts_ai_player.estimate_card_damage(attack("Unknown Attack")), 6)
+
+    def test_estimate_card_block_uses_known_base_and_upgrade_rules(self):
+        self.assertEqual(sts_ai_player.estimate_card_block(skill("Defend", "Defend_R")), 5)
+        self.assertEqual(sts_ai_player.estimate_card_block(skill("Defend+", "Defend_R", upgrades=1)), 8)
+        self.assertEqual(sts_ai_player.estimate_card_block(skill("Shrug It Off", upgrades=1)), 11)
+        self.assertEqual(sts_ai_player.estimate_card_block(skill("Unknown Skill")), 0)
+
+    def test_parse_play_command_converts_card_index_and_preserves_target_index(self):
+        self.assertEqual(sts_ai_player.parse_play_command("PLAY 2 0"), (1, 0))
+        self.assertEqual(sts_ai_player.parse_play_command("play 1"), (0, None))
+        self.assertIsNone(sts_ai_player.parse_play_command("END"))
+        self.assertIsNone(sts_ai_player.parse_play_command("PLAY Strike 0"))
+        self.assertIsNone(sts_ai_player.parse_play_command("PLAY 1 target"))
+
+    def test_model_command_attack_damage_requires_targeted_card_and_target(self):
+        combat = {
+            "hand": [
+                skill("Defend", "Defend_R"),
+                attack("Bash", "Bash"),
+            ],
+            "monsters": [{"name": "Jaw Worm", "current_hp": 8, "block": 0}],
+        }
+
+        self.assertEqual(sts_ai_player.model_command_attack_damage("PLAY 2 0", combat), 8)
+        self.assertEqual(sts_ai_player.model_command_attack_damage("PLAY 2", combat), 0)
+        self.assertEqual(sts_ai_player.model_command_attack_damage("PLAY 1 0", combat), 0)
+        self.assertEqual(sts_ai_player.model_command_attack_damage("PLAY 9 0", combat), 0)
+
+    def test_model_command_is_lethal_attack_counts_monster_block(self):
+        combat = {
+            "hand": [
+                attack("Strike", "Strike_R"),
+                attack("Bash+", "Bash", upgrades=1),
+            ],
+            "monsters": [
+                {"name": "Cultist", "current_hp": 6, "block": 5},
+                {"name": "Louse", "current_hp": 10, "block": 0},
+            ],
+        }
+
+        self.assertFalse(sts_ai_player.model_command_is_lethal_attack("PLAY 1 0", combat))
+        self.assertTrue(sts_ai_player.model_command_is_lethal_attack("PLAY 2 1", combat))
+        self.assertFalse(sts_ai_player.model_command_is_lethal_attack("PLAY 2", combat))
+
+    def test_model_command_is_lethal_attack_counts_vulnerable(self):
+        combat = {
+            "hand": [attack("Bludgeon", cost=3)],
+            "player": {"energy": 3, "powers": []},
+            "monsters": [
+                {
+                    "name": "Lagavulin",
+                    "current_hp": 37,
+                    "block": 0,
+                    "powers": [{"name": "Vulnerable", "id": "Vulnerable", "amount": 2}],
+                }
+            ],
+        }
+
+        self.assertTrue(sts_ai_player.model_command_is_lethal_attack("PLAY 1 0", combat))
+
+    def test_choose_lethal_attack_prefers_lethal_enemy_with_highest_incoming_damage(self):
+        hand = [
+            attack("Strike", "Strike_R"),
+            attack("Bash", "Bash", cost=2),
+            {**attack("Carnage", cost=2), "is_playable": False},
+        ]
+        monsters = [
+            {"name": "Non-attacker", "current_hp": 6, "block": 0, "intent": "BUFF"},
+            {
+                "name": "Attacker",
+                "current_hp": 6,
+                "block": 0,
+                "intent": "ATTACK",
+                "move_adjusted_damage": 7,
+                "move_hits": 1,
+            },
+            {
+                "name": "Bigger attacker",
+                "current_hp": 8,
+                "block": 0,
+                "intent": "ATTACK",
+                "move_adjusted_damage": 12,
+                "move_hits": 1,
+            },
+        ]
+
+        self.assertEqual(sts_ai_player.choose_lethal_attack(hand, monsters, energy=2), (1, 2))
+
+    def test_choose_lethal_attack_ignores_unplayable_gone_and_blocked_survivors(self):
+        hand = [
+            attack("Strike", "Strike_R"),
+            {**attack("Bash", "Bash", cost=2), "is_playable": False},
+        ]
+        monsters = [
+            {"name": "Gone", "current_hp": 4, "block": 0, "is_gone": True},
+            {"name": "Blocked", "current_hp": 5, "block": 2},
+        ]
+
+        self.assertIsNone(sts_ai_player.choose_lethal_attack(hand, monsters, energy=1))
+
+    def test_choose_turn_lethal_attack_finds_multi_card_lagavulin_kill(self):
+        hand = [
+            skill("Defend", "Defend_R"),
+            attack("Pommel Strike"),
+            attack("Twin Strike"),
+            attack("Strike", "Strike_R"),
+            attack("Strike", "Strike_R"),
+        ]
+        monsters = [
+            {
+                "name": "Lagavulin",
+                "current_hp": 25,
+                "block": 0,
+                "intent": "ATTACK",
+                "move_adjusted_damage": 18,
+                "move_hits": 1,
+            }
+        ]
+
+        self.assertEqual(sts_ai_player.choose_turn_lethal_attack(hand, monsters, energy=3), (2, 0))
+
+    def test_combat_policy_prefers_turn_lethal_over_block(self):
+        hand = [
+            skill("Defend", "Defend_R"),
+            attack("Pommel Strike"),
+            attack("Twin Strike"),
+            attack("Strike", "Strike_R"),
+            attack("Strike", "Strike_R"),
+        ]
+        state = {
+            "act": 1,
+            "floor": 8,
+            "current_hp": 23,
+            "combat_state": {
+                "hand": hand,
+                "player": {"energy": 3, "block": 0, "current_hp": 23},
+                "monsters": [
+                    {
+                        "name": "Lagavulin",
+                        "current_hp": 25,
+                        "block": 0,
+                        "intent": "ATTACK",
+                        "move_adjusted_damage": 18,
+                        "move_hits": 1,
+                    }
+                ],
+            },
+        }
+
+        self.assertEqual(sts_ai_player.choose_combat_command(state, {"end"}), "PLAY 3 0")
+
+    def test_model_command_starts_turn_lethal_allows_attack_override(self):
+        combat = {
+            "hand": [
+                skill("Defend", "Defend_R"),
+                attack("Pommel Strike"),
+                attack("Twin Strike"),
+                attack("Strike", "Strike_R"),
+                attack("Strike", "Strike_R"),
+            ],
+            "player": {"energy": 3},
+            "monsters": [{"name": "Lagavulin", "current_hp": 25, "block": 0}],
+        }
+
+        self.assertTrue(sts_ai_player.model_command_starts_turn_lethal("PLAY 2 0", combat))
+        self.assertTrue(sts_ai_player.model_command_starts_turn_lethal("PLAY 3 0", combat))
+        self.assertFalse(sts_ai_player.model_command_starts_turn_lethal("PLAY 1", combat))
+
+    def test_rest_prefers_heal_before_forced_elite_route(self):
+        state = {
+            "current_hp": 58,
+            "max_hp": 80,
+            "map": [
+                {"symbol": "R", "x": 1, "y": 5, "children": [{"x": 2, "y": 6}]},
+                {"symbol": "?", "x": 2, "y": 6, "children": [{"x": 3, "y": 7}]},
+                {"symbol": "E", "x": 3, "y": 7, "children": []},
+            ],
+        }
+        sts_ai_player.LAST_CHOSEN_MAP_NODE = {"symbol": "R", "x": 1, "y": 5, "children": [{"x": 2, "y": 6}]}
+
+        self.assertGreater(sts_ai_player.rest_option_score("rest", state), sts_ai_player.rest_option_score("smith", state))
+
+    def test_seed_long_to_string_accepts_signed_logged_seed(self):
+        self.assertEqual(sts_ai_player.seed_long_to_string(-1), "5G24A25UXKXFF")
+
+
+if __name__ == "__main__":
+    unittest.main()
