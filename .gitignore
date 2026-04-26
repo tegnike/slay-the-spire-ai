@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+# Runtime output from CommunicationMod / AI decisions.
+logs/
+
+# Downloaded third-party mod artifacts are reproducible and large.
+downloads/
+
+# Local editor and OS metadata.
+.DS_Store
+.idea/
+.vscode/
