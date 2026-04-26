@@ -1129,3 +1129,394 @@ floor 6 RestRoom: smith -> GRID -> CHOOSE 0 -> CONFIRM -> PROCEED
 4. カード報酬スコアを実プレイログから調整する
 5. `states.jsonl` / `actions.jsonl` から要約ログを作る
 6. Codex CLIの起動コストを下げる方法を検討する
+
+## 2026-04-26 追加修正: Act 1突破確認
+
+ユーザー依頼で、上記残課題のうち戦闘判断、カード報酬、ポーション使用、LLM向け合法手説明を追加修正した。
+
+変更ファイル:
+
+```text
+/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/sts_ai_player.py
+```
+
+主な修正:
+
+- Act 1戦闘で `Defend` 偏重になりすぎないよう、リーサル、敵撃破、低被ダメージ時の攻撃継続を優先
+- OpenAI APIに渡すpolicy文言を修正し、「HP保全 = 常にブロック」ではなく「早く倒すこともHP保全」と明示
+- 合法手に `POTION Use <slot> [target]` を追加
+- Fire / Explosive / Block / Weak / Skill / Attack / Power 系ポーションの簡易使用判断を追加
+- カード報酬スコアを調整し、Act 1序盤では即戦力攻撃を高評価
+- `Feel No Pain`、`Body Slam`、`Corruption` などのシナジー依存カードは、現デッキに支えがない場合は評価を下げる
+- `Clash`、`Sword Boomerang`、`Searing Blow` などもデッキ状況に応じて減点
+- MAP合法手の説明にノード記号、座標、ルートスコアを含めるよう改善
+
+確認コマンド:
+
+```bash
+python3 -m py_compile sts_ai_player.py
+python3 sts_ai_player.py --test
+```
+
+結果:
+
+```text
+py_compile: OK
+--test: PLAY 1
+```
+
+### 実ゲーム検証
+
+`./run_modded.sh` で実際にMod付きゲームを起動し、新規ランを進めた。
+
+このシェルでは `OPENAI_API_KEY` / `STS_AI_OPENAI_API_KEY` が未設定だったため、OpenAI API経路ではなくルールベースfallbackのみで検証した。
+
+確認できた流れ:
+
+```text
+START IRONCLAD 0
+Neow選択
+Act 1序盤戦闘
+Act 1エリート Gremlin Nob 突破
+RestRoomで Bash+ にsmith
+TreasureRoomでRelic取得
+Act 1エリート Sentries 突破
+The Guardian 撃破
+Act 2 floor 18 まで到達
+```
+
+停止時点:
+
+```text
+floor: 18
+act: 2
+room: MonsterRoom
+screen: NONE
+phase: COMBAT
+HP: 73 / 80
+gold: 384
+act boss: Champ
+enemy: Spheric Guardian, 20 HP
+```
+
+確認できた良い点:
+
+- ルールベースだけでAct 1を突破できた
+- `Bash+`、`Inflame`、`Shockwave`、複数 `Twin Strike` / `Pommel Strike` を含む攻撃寄りデッキになった
+- Sentries戦で `Explosive Potion` を使用し、エリート戦を突破した
+- `GRID`、焚き火、宝箱、戦闘報酬、カード報酬、マップ選択は停止せず進行した
+- 実プレイ後、ゲームプロセスとAIプロセスを停止し、`launcher_opts.toml.codex-backup` が残っていないことを確認した
+
+### 追加で見つかった残課題
+
+1. OpenAI API込みの再検証
+   - 今回はAPIキー未設定だったため、OpenAI判断は未検証
+   - `OPENAI_API_KEY` を起動プロセスに渡した状態で、今回のpolicy変更後の判断品質を確認する必要がある
+
+2. ボス戦でのポーション使用が遅い
+   - The Guardian戦ではHP 13まで落ちた
+   - その後勝てたが、`Skill Potion` をより早めに使う判断が必要
+   - この観察後に、Skill / Attack / Power Potionを危険部屋や大ダメージ時に使うルールを追加した
+   - 追加後の実ゲーム再検証はまだ
+
+3. Act 2以降の戦闘評価が粗い
+   - Spheric Guardianなど、Act 2敵の特殊行動やブロック/アーティファクトをまだ深く見ていない
+   - SentriesやGuardianは突破できたが、Act 2エリートやボス向けには不足
+
+4. Smoke Bombの扱い
+   - Act 2到達時に `Smoke Bomb` を持っていた
+   - 現状は使用判断なし
+   - 死にそうな通常戦闘では逃走候補にしてよいが、エリート/ボスでは使えない・使うべきでない場面があるため注意
+
+5. 報酬取り順とカード報酬のログ分析
+   - 戦闘報酬ではカード、ゴールド、ポーションを回収できているが、ログ上は高速に複数 `CHOOSE` が並ぶ
+   - 今後は状態と行動を同一タイムラインで要約するログを作ると、悪手分析がかなり楽になる
+
+6. 実行中プロセスへのコード反映
+   - 実行中の `sts_ai_player.py` にはコード修正が反映されない
+   - ポーション判断などを変更した後は、必ずSlay the Spire / ModTheSpire / AIプロセスを再起動する
+
+### 次にやるとよいこと更新
+
+優先度順:
+
+1. `OPENAI_API_KEY` を渡してOpenAI API込みでAct 1〜Act 2を再検証
+2. Skill Potion / Smoke Bomb / Fairy in a Bottle周りの判断を実ログで確認
+3. Act 2通常敵、エリート、ボス用の敵別ヒューリスティックを追加
+4. `states.jsonl` と `actions.jsonl` を時系列で結合する要約ログ/ループ検知ツールを作る
+5. ショップ購入、カード削除、イベント選択のログを実ランで確認して調整
+
+## 2026-04-26 追加修正: API失敗耐性とマップ先読み
+
+ユーザー指定の `OPENAI_API_KEY` と `gpt-5.4-mini` で実ゲーム起動を行った。
+
+今回の実行ログ:
+
+```text
+logs/run-20260426-143822
+logs/run-20260426-144140
+```
+
+確認結果:
+
+- `gpt-5.4-mini` の直接API呼び出しは、最初のスモークテストでは応答した
+- その後の実ゲーム起動では OpenAI API が `401 Unauthorized` を返した
+- 連続で401を叩き続けないよう、401/403を受けたプロセスではOpenAI APIを無効化し、以降はルールベースfallbackへ即時切替するよう修正した
+- 401発生後もゲームは停止せず、fallbackのみでランを継続できた
+
+追加したファイル:
+
+```text
+tools/summarize_run.py
+```
+
+用途:
+
+```bash
+python3 tools/summarize_run.py --log-dir logs/run-YYYYMMDD-HHMMSS --last 80
+```
+
+`states.jsonl` と `actions.jsonl` を同じ件数だけ末尾から読み、floor / screen / room / HP / hand / monsters / choices / command を短く表示する。巨大な `states.jsonl` を全読みしないよう、ファイル末尾から必要行だけ読む実装にした。一定回数以上同じ signature が出ると `Potential loops` として表示する。
+
+今回見つけた問題:
+
+1. LLM判断の安全弁
+   - APIスモークテストで、Jaw Worm 12点被弾に対して `Defend` ではなく `Strike` を選ぶケースがあった
+   - 高被弾局面でfallbackが防御/ポーションを選んでいる場合、LLMが非リーサル攻撃を選んでもfallbackへ戻す安全弁を追加した
+
+2. 低HPでの将来エリート
+   - HP 46/80から、数部屋先で強制Lagavulinになるルートへ入り死亡した
+   - `MAP` の評価にフルマップの `children` を使った先読みを追加し、近い将来のエリートを低評価、休憩所を高評価するようにした
+   - 直近の再現ログでは、floor 3 の分岐が `M` 優先から `?` 優先へ変わることを確認した
+
+3. イベント選択
+   - カード記憶系イベントで `Pain` を選びやすい状態があった
+   - `pain` / `curse` を低評価、匿名 `cardN` を控えめ評価にした
+
+4. ポーション
+   - Smoke Bombは通常戦闘で死亡級の被弾が見える場合だけ使用候補にした
+   - エリート/ボスでは使わない
+
+確認コマンド:
+
+```bash
+python3 -m py_compile sts_ai_player.py tools/summarize_run.py
+python3 sts_ai_player.py --test
+```
+
+結果:
+
+```text
+--test: PLAY 1
+py_compile: OK
+```
+
+注意:
+
+- 2026-04-26 14:41時点では、指定APIキーがOpenAI APIから `401 Unauthorized` を返す
+- APIキーが復旧/差し替えされるまでは、`--use-openai-api --openai-model gpt-5.4-mini` を指定していても初回401後はfallbackのみで進行する
+
+### 追加で残っている課題
+
+次回以降に優先して対応する。
+
+1. エリート別の戦闘ヒューリスティック
+   - Lagavulin / Gremlin Nob / Sentries の専用判断がまだ弱い
+   - Lagavulinでは、起床前の準備、起床後のブロック/攻撃配分、デバフターンの扱いを分ける必要がある
+   - Gremlin Nobでは、不要なSkill連打を避け、短期火力とポーション使用を優先する必要がある
+   - Sentriesでは、中央/端の倒す順番、Dazed増加前の火力集中、AoE/ポーション評価を強める必要がある
+
+2. カード報酬とショップ購入の長期評価
+   - 現在のカード報酬はAct 1序盤の前のめりな攻撃評価が中心
+   - デッキの防御、ドロー、スケーリング、エナジー、状態異常対策を見た評価はまだ浅い
+   - ショップはカード削除と一部高評価カード/レリック購入に対応しているが、所持金、今後のショップ、ポーション枠、ボス対策を含む長期判断は未実装
+
+3. 死亡後の自動再スタート制御
+   - 現状は `--auto-start` のため、死亡後に自動で次ランへ入ることがある
+   - 長時間連続検証には便利だが、1ラン単位の失敗分析では死亡時点で停止した方が扱いやすい
+   - `--stop-on-game-over` のようなオプションを追加し、GAME_OVER時は `WAIT` / `STATE` / プロセス終了などを選べるようにするとよい
+
+## 2026-04-26 追加修正: ポーション報酬停止とLLM安全弁
+
+ユーザー指定の `OPENAI_API_KEY` と `gpt-5.4-mini` でAPI疎通を確認後、実ゲームを起動して検証した。
+
+今回の実行ログ:
+
+```text
+logs/run-20260426-145905
+logs/run-20260426-150532
+```
+
+API確認:
+
+- 事前スモークテストで `gpt-5.4-mini` へのResponses API呼び出しは `200 OK`
+- 実ゲーム中もOpenAI API判断が記録された
+- 今回の検証中、401/403などのAPIエラーは発生しなかった
+
+追加修正:
+
+- `COMBAT_REWARD` のポーション報酬で、ポーション枠満杯時の処理を追加
+  - `Fruit Juice` など報酬画面で使える非ターゲットポーションは `POTION Use <slot>` で先に使用
+  - 使えるポーションがなければ、報酬ポーションの価値が手持ち最低価値より高い場合だけ `POTION Discard <slot>`
+  - 捨てる価値がないポーション報酬だけが残った場合は `PROCEED`
+- CommunicationMod仕様に合わせて `POTION Use|Discard PotionSlot [TargetIndex]` を使うようにした
+- OpenAI判断の画面安全弁を強化
+  - `CARD_REWARD` のモデル選択がルール評価より明確に低い場合はfallbackへ戻す
+  - 無被弾ターンにモデルが純ブロックカードを選んだ場合は `END` へ戻す
+  - `Disarm` / `Shockwave` / `Intimidate` は高被弾時の防御的プレイとして扱い、Defend安全弁で誤って潰さないようにした
+- 実戦で見えた敵別/場面別の補強
+  - Gremlin Nobでは不要なSkill防御を抑制
+  - Lagavulinの睡眠/デバフターンを判定
+  - setupカードとして `Inflame` / `Metallicize` / `Shockwave` / `Offering` などを評価
+  - マップ先読みの子ノード処理を壊れにくくした
+
+実ゲームで見つけた停止:
+
+```text
+floor: 4
+screen_type: COMBAT_REWARD
+reward: Heart of Iron potion
+potions: Fear Potion, Fire Potion, Fruit Juice
+available_commands: choose, potion, proceed, key, click, wait, state
+```
+
+旧挙動:
+
+```text
+CHOOSE 0
+```
+
+ポーション枠が満杯のため進まず、ゲーム側が待機した。
+
+修正後の同状態でのルール判断:
+
+```text
+POTION Use 2
+```
+
+`Fruit Juice` を使って枠を空けるため、次状態で報酬ポーションを取得できる。
+
+2回目の実ゲーム検証では以下を確認した。
+
+```text
+START IRONCLAD 0
+Neow's Lament選択
+floor 1-4突破
+GRIDイベントでカード選択/CONFIRM
+COMBAT_REWARD / CARD_REWARD / MAP進行
+floor 5 Large Slime戦突破
+floor 6 RestRoom手前まで到達
+```
+
+観察:
+
+- OpenAIはNeowで `max hp +8` を選ぼうとしたが、画面スコア安全弁により `enemies in your next three combats have 1 hp` へ上書きされた
+- Large Slime戦ではHP 80 -> 54まで減った。停止はしていないが、Act 1後半の大型敵に対してはまだ被弾が大きい
+- 高被弾時のモデル攻撃選択は複数回fallbackへ戻せた
+- 無被弾ターンに `Defend` を選ぶ無駄打ちがあったため、純ブロック安全弁を追加した
+
+確認コマンド:
+
+```bash
+python3 -m py_compile sts_ai_player.py tools/summarize_run.py
+python3 sts_ai_player.py --test
+```
+
+結果:
+
+```text
+py_compile: OK
+--test: PLAY 1
+```
+
+残課題:
+
+1. Act 1後半の大型通常敵とエリートでの被弾削減
+   - Large Slime戦で被弾が大きい
+   - `Disarm` や弱体化系カード/ポーションをより早く使う判断を実ログで調整する
+2. `CARD_REWARD` の長期評価
+   - `True Grit`、`Sever Soul`、`Disarm` などは取れているが、防御/ドロー/火力のバランスはまだ粗い
+3. 1ラン単位の検証制御
+   - `--stop-on-game-over` や `--max-floor` があると、実験ログの切り分けがしやすい
+
+## 2026-04-26 追加修正: 実走デバッグによる安全弁強化
+
+ユーザー指定どおり、`gpt-5.4-mini` のOpenAI API経路で疎通確認後、実ゲームを起動して検証した。APIキーは環境変数として起動プロセスに渡し、設定ファイルやノートには保存していない。
+
+今回の実行ログ:
+
+```text
+logs/run-20260426-152248
+logs/run-20260426-152714
+```
+
+API確認:
+
+- 事前スモークテストで `gpt-5.4-mini` は正常応答
+- 実ゲーム中も `openai_api elapsed=... model=gpt-5.4-mini` が継続記録された
+- 401/403などのAPIエラーは発生しなかった
+
+追加修正:
+
+- `Disarm` のような対象指定デバフをfallbackルールでも使えるようにした
+- Sentries戦では外側Sentryを少し優先するターゲット補正を追加
+- GRID / REST 画面にもOpenAI判断の画面スコア安全弁を追加
+  - Bashアップグレードより大きく劣るGRID選択をfallbackへ戻す
+  - 低HP時にsmithを選ぶ判断をrestへ戻す
+- 無被弾ターンに純ブロックカードを選ぶOpenAI判断をfallbackへ戻す
+- 危険戦闘でHPに余裕があり、高打点攻撃を選んだ場合は安全弁で過剰に潰さないよう調整
+- 同一戦闘ターンで `POTION Use` を連打しないよう、使用済みターンを記録する安全弁を追加
+- `Duplication Potion` は危険戦闘や大ダメージ局面だけ使う候補にした
+- 休憩所判断を保守化し、HP55%以下では `rest` を優先するよう修正
+
+実ゲームで確認できたこと:
+
+```text
+run-20260426-152248:
+  floor 7 Lagavulinまで到達
+  API判断・安全弁・ポーション使用を確認
+  同一ターンに複数ポーションを使う余地が見えたため停止して修正
+
+run-20260426-152714:
+  Neow's Lament選択
+  GRIDイベント進行
+  floor 5 Large Slime突破
+  floor 6 Sentries突破
+  floor 8 RestRoomまで到達
+```
+
+実走で見つけた問題と対応:
+
+1. 同一ターンのポーション連打
+   - Lagavulin戦でモデルがポーションを連続使用する余地があった
+   - `POTION_USED_TURNS` を追加し、同一 `seed / act / floor / combat turn` で2本目を原則fallbackへ戻す
+
+2. 低HP休憩所でsmithを選ぶ
+   - Sentries突破後、HP40/80のRestRoomで旧ルールはsmithを選んだ
+   - HP55%以下ではrestを強く優先するように変更
+   - 同じログ状態で `CHOOSE 0`、OpenAIのsmith選択は `low_heuristic_screen_score` で上書きされることを確認
+
+3. 安全弁の過剰防御
+   - Lagavulin戦でモデルのBash+などの高打点攻撃を防御fallbackへ戻しすぎていた
+   - エリート/ボスでHPに余裕があり、攻撃推定ダメージが十分ある場合はモデル攻撃を許容するよう調整
+
+確認コマンド:
+
+```bash
+python3 -m py_compile sts_ai_player.py tools/summarize_run.py
+python3 sts_ai_player.py --test
+```
+
+結果:
+
+```text
+py_compile: OK
+--test: PLAY 1
+```
+
+残課題:
+
+1. Sentries戦でHP73 -> 40まで削られたため、Sentries専用のターゲット順と防御/攻撃配分はまだ改善余地が大きい
+2. Large SlimeなどのAct 1大型通常敵で、分裂前後のHP調整がまだ粗い
+3. 休憩所の `rest` 修正は過去ログ状態で確認済みだが、修正後コードでの実ゲーム再走は未実施
+4. `tools/summarize_run.py` は状態/行動の表示が一部ずれて見えることがあるため、時刻付き状態ログにするか、index検証を強化するとよい

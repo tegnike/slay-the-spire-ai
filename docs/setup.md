@@ -83,12 +83,22 @@ python3 /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/sts_ai_pl
 同時に `runAtGameStart=true` を設定するため、Mod起動時にAIプロセスが自動起動します。
 OpenAI API実行に失敗した場合、または `OPENAI_API_KEY` が未設定の場合は、ゲームを止めないためルールベース判断に戻ります。
 
-OpenAI API版で実際にLLM判断させる場合は、Slay the Spireを起動するプロセスに `OPENAI_API_KEY` を渡してください。APIキーは `config.properties` には書かない方針です。
+OpenAI API版で実際にLLM判断させる場合は、Slay the Spireを起動するプロセスに `OPENAI_API_KEY` を渡してください。APIキーは `config.properties` やドキュメントには書かない方針です。
 
 ```bash
 export OPENAI_API_KEY="..."
 cd /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai
 ./run_modded.sh
+```
+
+ランごとにログを分けたい場合は、起動前に `STS_AI_LOG_DIR` を設定します。
+
+```bash
+cd /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai
+RUN_ID="run-$(date +%Y%m%d-%H%M%S)"
+export STS_AI_LOG_DIR="$PWD/logs/$RUN_ID"
+mkdir -p "$STS_AI_LOG_DIR"
+OPENAI_API_KEY="..." ./run_modded.sh
 ```
 
 別モデルを試す場合は、設定作成時に `--command` で指定します。
@@ -100,10 +110,11 @@ python3 tools/configure_communication_mod.py --command 'python3 /Users/user/Work
 ## 5. 起動手順
 
 1. Slay the Spireを終了する
-2. このプロジェクトから `./run_modded.sh` を実行する
-3. ModTheSpire画面で BaseMod と CommunicationMod を有効化して Play
+2. このプロジェクトから `OPENAI_API_KEY="..." ./run_modded.sh` を実行する
+3. ModTheSpireが `basemod,CommunicationMod` 指定で起動する
 4. CommunicationMod がAIプロセスを起動する
-5. `logs/session.log` に受信状態と返答コマンドが出ることを確認する
+5. AIが `ready` を返し、`--auto-start` により `START IRONCLAD 0` を返す
+6. `logs/session.log` に受信状態と返答コマンドが出ることを確認する
 
 ## 6. 最初の確認ポイント
 
@@ -113,6 +124,7 @@ python3 tools/configure_communication_mod.py --command 'python3 /Users/user/Work
 - `logs/session.log` が作成される
 - `logs/states.jsonl` にゲーム状態JSONが追記される
 - `logs/actions.jsonl` に返したコマンドが追記される
+- OpenAI APIを使っている場合は `logs/openai_decisions.jsonl` に判断理由が追記される
 
 接続に失敗する場合:
 
@@ -122,11 +134,52 @@ python3 tools/configure_communication_mod.py --command 'python3 /Users/user/Work
 - Modのjar配置または有効化ができていない
 - Java Runtimeがなく、ModTheSpireを起動できていない
 
-## 7. 次の拡張
+OpenAI APIで401/403が出る場合:
+
+- AIプロセスはその実行中のOpenAI API呼び出しを無効化し、ルールベース判断へフォールバックする
+- APIキーの権限、期限、課金状態を確認する
+- APIキーはCommunicationModの `config.properties` には保存せず、起動プロセスの環境変数で渡す
+
+## 7. 現在のAI挙動
+
+現在は、コード側が合法手一覧を作り、OpenAI Responses APIには `action_id` だけを選ばせます。API失敗時、未設定時、不正な判断時はルールベースfallbackを実行します。
+
+主な対応済み画面:
+
+- メインメニュー: `--auto-start` で Ironclad / Ascension 0 を開始
+- 戦闘: カード、対象、ポーション、ターン終了を合法手化
+- 戦闘報酬: レリック、カード、ゴールド、ポーションを回収
+- カード報酬: Act 1の前のめりな攻撃、強カード、防御カードを簡易評価
+- GRID: purge / upgrade / transform / selection を用途別に選択して確定
+- MAP: HP、ゴールド、休憩所、将来エリートを見て評価
+- REST: HP55%以下では休憩、それ以外はsmithを優先
+- SHOP: 入退店ループを避け、削除や高評価カード/レリック/ポーションだけ購入
+- FTUE: `KEY Confirm 30` でゲーム内Confirmを送る
+
+OpenAI API判断には安全弁があります。
+
+- 高被弾時に防御/ポーションfallbackを無視した攻撃を選んだ場合はfallbackへ戻す
+- HPに余裕があるエリート/ボスで高打点攻撃を選んだ場合は過剰に潰さない
+- 無被弾ターンに純ブロックカードを選んだ場合はfallbackへ戻す
+- GRID / REST / EVENT / CARD_REWARD / MAP でルール評価より大きく劣る選択はfallbackへ戻す
+- 同一戦闘ターンのポーション連打を抑制する
+
+## 8. ログ分析
+
+ラン別ログを要約するには:
+
+```bash
+python3 tools/summarize_run.py --log-dir logs/run-YYYYMMDD-HHMMSS --last 120
+```
+
+`states.jsonl` と `actions.jsonl` の末尾を並べ、floor / screen / room / HP / hand / monsters / choices / command を短く表示します。一定回数以上同じ画面とコマンドが繰り返される場合は `Potential loops` として表示します。
+
+## 9. 次の拡張
 
 疎通確認後、次の順で拡張します。
 
-1. 戦闘状態から合法手一覧を作る
-2. OpenAI APIに合法手IDだけ選ばせる
-3. カード報酬、マップ、焚き火、ショップを個別対応する
-4. 1ランのログを保存して、負け筋を解析する
+1. Sentries / Lagavulin / Gremlin Nob の専用戦闘ヒューリスティックを強化する
+2. Large Slimeなど分裂敵のHP調整を追加する
+3. Act 2以降の敵別判断を追加する
+4. カード報酬、ショップ、イベントの長期評価を改善する
+5. 1ラン単位の検証用に `--stop-on-game-over` や `--max-floor` を追加する
