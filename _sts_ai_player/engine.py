@@ -558,9 +558,21 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
     if not legal_actions:
         return fallback_command
 
+    decision_payload = build_decision_payload(state, legal_actions, fallback_command)
+    append_jsonl(
+        "openai_requests.jsonl",
+        {
+            "time": time.time(),
+            "state_index": raw.get("_sts_ai_log_index"),
+            "process_id": raw.get("_sts_ai_process_id"),
+            "model": options.openai_model,
+            "payload": decision_payload,
+        },
+    )
+
     try:
         decision = run_openai_responses_api(
-            build_decision_payload(state, legal_actions, fallback_command),
+            decision_payload,
             [action.action_id for action in legal_actions],
             options,
             api_key,
