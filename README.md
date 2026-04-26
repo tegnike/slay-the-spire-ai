@@ -1,47 +1,98 @@
 # Slay the Spire AI Player
 
-CommunicationMod から Slay the Spire のJSON状態を受け取り、コマンドを返す最小AIプレイヤーです。
+Slay the Spire を Mod 経由で外部 AI プロセスにつなぎ、ゲーム状態 JSON から合法手を選んで操作する実験用プレイヤーです。
 
-現時点の目的は「ゲームと外部AIプロセスを接続し、LLMまたはルールベースで合法手から行動を選ばせる」ことです。ゲームへ送るコマンドは必ずコード側で生成した合法手に限定し、LLMが不正な手を返した場合はルールベース判断へフォールバックします。OpenAI API自体の失敗時は、エラーを見落とさないよう停止します。
+画面認識やキーボードマクロではなく、CommunicationMod が出す状態を Python が受け取り、`PLAY` / `END` / `CHOOSE` / `CONFIRM` / `PROCEED` などのコマンドを返します。
 
-## 構成
+```text
+Slay the Spire
+  -> ModTheSpire + BaseMod + CommunicationMod
+  -> stdin/stdout
+  -> sts_ai_player.py
+  -> OpenAI API or rule-based policy
+```
 
-- `sts_ai_player.py`: CommunicationMod 用のAIプロセス
-- `run_modded.sh`: Macアプリ本体経由でModTheSpireを起動するランチャー
-- `tools/configure_communication_mod.py`: Mac用のCommunicationMod設定ファイル作成補助
-- `tools/summarize_run.py`: `states.jsonl` / `actions.jsonl` の簡易要約とループ検知
-- `docs/setup.md`: Mod導入と起動手順
+現在の主目的は、勝率最適化ではなく「ゲームと AI 判断ループを安定して接続し、ランを自動進行させる」ことです。
+
+## 主要ファイル
+
+- `sts_ai_player.py`: CommunicationMod から起動される AI プロセス
+- `_sts_ai_player/`: AI 本体の実装
+- `run_modded.sh`: Mac アプリ本体経由で ModTheSpire を起動するランチャー
+- `tools/configure_communication_mod.py`: CommunicationMod の `config.properties` 作成補助
+- `tools/summarize_run.py`: ランログの要約とループ検知
+- `docs/setup.md`: Mod 導入と起動の詳細
+- `docs/session-notes-2026-04-26.md`: 初回構築時の作業メモ
 - `logs/`: 実行時ログの出力先
 
-## 使い方
+## 前提
 
-まず疎通テストだけ行います。
+このリポジトリは、Mac 版 Steam の Slay the Spire で動かす前提です。
+
+確認済みのゲーム配置:
+
+```text
+/Users/user/Library/Application Support/Steam/steamapps/common/SlayTheSpire
+```
+
+必要な Mod:
+
+- ModTheSpire
+- BaseMod
+- CommunicationMod
+
+この環境では ModTheSpire / BaseMod は Steam Workshop 版を使い、CommunicationMod は GitHub Release の jar をゲーム側 `mods` ディレクトリへ置く構成で確認しています。詳しい配置は [docs/setup.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/setup.md) を見てください。
+
+## プレイ手順
+
+### 1. 疎通テスト
+
+まず AI プロセス単体でルールベース判断が動くことを確認します。
 
 ```bash
 cd /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai
 python3 sts_ai_player.py --test
 ```
 
-CommunicationMod 側に設定するコマンドは次の形です。
+OpenAI API まで含めて確認する場合:
 
 ```bash
-python3 /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/sts_ai_player.py --auto-start --use-openai-api --openai-model gpt-5.4-mini
+OPENAI_API_KEY="..." python3 sts_ai_player.py --test --use-openai-api --openai-model gpt-5.4-mini
 ```
 
-設定ファイルを作る場合は:
+### 2. CommunicationMod 設定を作る
+
+通常プレイでは、CommunicationMod が起動する AI コマンドを設定ファイルに書きます。
 
 ```bash
 python3 tools/configure_communication_mod.py
 ```
 
-Mod付きで起動する場合は:
+作成される主な内容:
+
+```properties
+command=python3 /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/sts_ai_player.py --auto-start --use-openai-api --openai-model gpt-5.4-mini
+runAtGameStart=true
+```
+
+`runAtGameStart=true` により Mod 起動時に AI プロセスが自動起動します。`--auto-start` により、メインメニューから Ironclad / Ascension 0 のランを開始します。
+
+ルールベースだけで動かしたい場合は、`--use-openai-api` を外したコマンドで設定します。
+
+```bash
+python3 tools/configure_communication_mod.py \
+  --command 'python3 /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/sts_ai_player.py --auto-start'
+```
+
+### 3. Mod 付きで起動する
+
+OpenAI API 版でプレイする場合:
 
 ```bash
 OPENAI_API_KEY="..." ./run_modded.sh
 ```
 
-APIキーを渡さない場合も停止はせず、ルールベース判断だけで進みます。
-ランごとにログを分けたい場合は `STS_AI_LOG_DIR` を指定します。
+ランごとにログを分ける場合:
 
 ```bash
 RUN_ID="run-$(date +%Y%m%d-%H%M%S)"
@@ -50,43 +101,25 @@ mkdir -p "$STS_AI_LOG_DIR"
 OPENAI_API_KEY="..." ./run_modded.sh
 ```
 
-Macでは `jre/bin/java -jar ModTheSpire.jar` の直接起動でLWJGL/OpenGLのクラッシュが出ることがあるため、このスクリプトは `launcher_opts.toml` を一時的に差し替えて `SlayTheSpire.app` 本体から起動します。
+`run_modded.sh` は `launcher_opts.toml` を一時的に差し替え、Mac アプリ本体 `Contents/MacOS/SlayTheSpire` 経由で Workshop 版 ModTheSpire を起動します。直接 `jre/bin/java -jar ModTheSpire.jar` すると Mac の LWJGL/OpenGL 初期化でクラッシュすることがあったため、この起動方法にしています。
 
-詳細は [docs/setup.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/setup.md) を見てください。
+### 4. 動作確認
 
-## 現在のAI
+接続できている場合、ModTheSpire 側に `CommunicationMod` が表示され、AI プロセスから `ready` が返ります。
 
-通常はOpenAI Responses APIで判断します。現在の起動設定は `gpt-5.4-mini` です。`OPENAI_API_KEY` が未設定、またはAPI呼び出しに失敗した場合は停止してエラーを出します。`--use-codex` を付けた場合は、比較用にCodex CLI経由でも同じ合法手選択を試せます。
-
-OpenAI APIへ渡す状態には、HP/ゴールド/レリック/ポーションだけでなく、デッキ、手札、山札、捨て札、廃棄札、敵intent、powers、報酬、ショップ候補、マップ候補などの要約を含めます。
-
-- メインメニューでは `--auto-start` を付けた場合だけ Ironclad / Ascension 0 を開始
-- 戦闘では、プレイ可能なカード、対象、ターン終了を合法手にする
-- `GRID` 画面では、カード選択と確定を合法手にする
-- 戦闘報酬はカード/レリック/ゴールド/ポーションを優先順で回収する
-- カード報酬は簡易スコアで選び、通常報酬では進行安定のため最善候補を取得する
-- ショップはカード削除や有用な購入候補を選び、候補がなければ `LEAVE` する
-- マップは通常戦闘とイベントを優先し、低HP時は休憩所、高HPかつ強化済みならエリートも許容する
-- 休憩所は低HPや直近の強制Elite/Bossを考慮し、危険なら休憩、それ以外は smith を選ぶ
-- 報酬やイベントは原則 `PROCEED` / `RETURN` / 先頭選択で進める
-- すべての入力JSONと返したコマンドを `logs/` に保存
-- OpenAI APIへ送る判断payloadは `logs/openai_requests.jsonl` に保存
-- OpenAI APIの判断は `logs/openai_decisions.jsonl` に保存
-- Codex CLIの判断は `logs/codex_decisions.jsonl` に保存
-
-OpenAI API判断は、合法手リスト内の `action_id` を選べた場合はそのまま実行します。ルールベースのfallbackはOpenAIへは提示せず、不正な `action_id` などLLM出力エラー時の保険としてのみ使います。AIの性能テストを妨げないよう、戦略判断の上書きは行いません。
-
-設定スクリプトが書き込むOpenAI APIモデルは `gpt-5.4-mini` です。変える場合は `--openai-model` または `STS_AI_OPENAI_MODEL` を使います。
-
-デフォルトのCodexモデルは `gpt-5.3-codex` です。変える場合は `--codex-model` または `STS_AI_CODEX_MODEL` を使います。Codex実行ファイルは通常 `/Applications/Codex.app/Contents/Resources/codex` を自動検出します。
-
-## ログ確認
-
-セッションログ:
+AI 側では以下のログが増えます。
 
 ```bash
 tail -f logs/session.log
 ```
+
+主なログ:
+
+- `states.jsonl`: CommunicationMod から受信したゲーム状態
+- `actions.jsonl`: AI が返したコマンド
+- `openai_requests.jsonl`: OpenAI API へ送った判断 payload
+- `openai_decisions.jsonl`: OpenAI API の判断結果
+- `codex_decisions.jsonl`: Codex CLI 判断を使った場合の結果
 
 ラン別ログを要約する場合:
 
@@ -94,4 +127,71 @@ tail -f logs/session.log
 python3 tools/summarize_run.py --log-dir logs/run-YYYYMMDD-HHMMSS --last 120
 ```
 
-現時点では、OpenAI API込みでNeow選択、戦闘報酬、カード報酬、GRID、休憩所、マップ、Act 1エリート突破まで実走確認済みです。勝率を狙う段階ではなく、Act 1大型敵やAct 2以降の敵別判断にはまだ改善余地があります。
+## AI の判断方式
+
+コード側が現在画面で実行可能な合法手リストを作り、OpenAI API にはその中の `action_id` だけを選ばせます。ゲームへ送るコマンドは、コード側が生成した合法手に限定します。
+
+OpenAI API 判断では、ルールベースの fallback action を候補として提示しません。合法な `action_id` を選べた場合はそのまま実行し、不正な `action_id` など LLM 出力エラー時だけルールベース判断へ戻します。API キー未設定、認証エラー、API 呼び出し失敗などは見落とさないよう停止します。
+
+比較用に Codex CLI を使う場合は `--use-codex` を指定できます。デフォルトの Codex モデルは `gpt-5.3-codex` です。
+
+主な対応済み画面:
+
+- メインメニュー: `--auto-start` で Ironclad / Ascension 0 を開始
+- 戦闘: カード、対象、ポーション、ターン終了を合法手化
+- 戦闘報酬: レリック、カード、ゴールド、ポーションを回収
+- カード報酬: 序盤攻撃、強カード、防御カードを簡易評価
+- GRID: 削除、強化、変化、選択系画面を用途別に処理
+- MAP: HP、ゴールド、休憩所、将来エリートを見て評価
+- REST: 低 HP や直近の強制 Elite/Boss を見て休憩か smith を選択
+- SHOP: 入退店ループを避け、削除や高評価候補だけ購入
+- FTUE: 必要に応じてゲーム内 Confirm を送る
+
+## よく使うオプション
+
+```bash
+# 指定キャラクター / アセンションで開始
+python3 sts_ai_player.py --auto-start --character IRONCLAD --ascension 0
+
+# 指定 floor 到達後に待機
+python3 sts_ai_player.py --auto-start --max-floor 10
+
+# 死亡画面で次ランを自動開始せず待機
+python3 sts_ai_player.py --auto-start --stop-on-game-over
+
+# OpenAI モデル変更
+python3 sts_ai_player.py --auto-start --use-openai-api --openai-model gpt-5-mini
+```
+
+設定ファイルに反映する場合は `tools/configure_communication_mod.py --command '...'` で上記コマンドを指定します。
+
+## 確認済みの到達点
+
+2026-04-26 時点では、OpenAI API 込みで Neow 選択、戦闘、戦闘報酬、カード報酬、GRID、休憩所、マップ、Act 1 エリート突破まで実走確認済みです。
+
+まだ勝率を狙う段階ではありません。特に Act 1 大型敵、分裂敵、Act 2 以降の敵別判断、長期的なカード報酬 / ショップ / イベント評価には改善余地があります。
+
+## トラブルシュート
+
+CommunicationMod が AI プロセスを起動しない場合:
+
+- `config.properties` の `command=` のパスを確認する
+- `runAtGameStart=true` が入っているか確認する
+- ModTheSpire で `basemod,CommunicationMod` が有効になっているか確認する
+- `python3` が実行できるか確認する
+
+OpenAI API 版が止まる場合:
+
+- `OPENAI_API_KEY` または `STS_AI_OPENAI_API_KEY` が起動プロセスに渡っているか確認する
+- API キーの権限、期限、課金状態を確認する
+- まず `python3 sts_ai_player.py --test --use-openai-api --openai-model gpt-5.4-mini` を実行する
+
+ModTheSpire の直接起動でクラッシュする場合:
+
+- `./run_modded.sh` から起動する
+- Mac アプリ同梱 Java と Workshop 版 ModTheSpire / BaseMod を使う
+
+## 詳細資料
+
+- [docs/setup.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/setup.md): Mod 配置、CommunicationMod 設定、起動確認の詳細
+- [docs/session-notes-2026-04-26.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/session-notes-2026-04-26.md): 初回構築時に確認したパス、ログ、判断メモ
