@@ -27,7 +27,9 @@ Slay the Spire
 
 ## 前提
 
-このリポジトリは、Mac 版 Steam の Slay the Spire で動かす前提です。
+このリポジトリは、Mac 版 Steam の Slay the Spire でのみ動作確認しています。
+
+Windows は現時点では未対応・未検証です。AI 本体は CommunicationMod の stdin/stdout プロトコルなので移植できる可能性はありますが、`run_modded.sh`、CommunicationMod 設定パス、Steam / Mod の配置パスは macOS 前提です。
 
 確認済みのゲーム配置:
 
