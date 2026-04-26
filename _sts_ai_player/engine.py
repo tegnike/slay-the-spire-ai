@@ -554,11 +554,11 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
 
     available = normalize_available(raw)
     state = raw.get("game_state") or {}
-    legal_actions = build_legal_actions(state, available, fallback_command)
+    legal_actions = build_legal_actions(state, available, fallback_command, include_fallback_action=False)
     if not legal_actions:
         return fallback_command
 
-    decision_payload = build_decision_payload(state, legal_actions, fallback_command)
+    decision_payload = build_decision_payload(state, legal_actions)
     append_jsonl(
         "openai_requests.jsonl",
         {
@@ -626,87 +626,7 @@ def openai_override_reason(
     fallback_command: str,
     decision: dict[str, Any],
 ) -> str | None:
-    if model_command == fallback_command:
-        return None
-
-    try:
-        confidence = float(decision.get("confidence"))
-    except (TypeError, ValueError):
-        confidence = 1.0
-    if confidence < 0.25:
-        return "low_confidence"
-
-    combat = state.get("combat_state") or {}
-    if not combat:
-        return screen_override_reason(state, model_command, fallback_command)
-
-    screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
-    if screen_type not in {"", "NONE"}:
-        reason = screen_override_reason(state, model_command, fallback_command)
-        if reason:
-            return reason
-
-    monsters = combat.get("monsters") or []
-    player = combat.get("player") or {}
-    incoming = estimate_incoming_damage(monsters)
-    current_block = int(player.get("block") or 0)
-    current_hp = int(player.get("current_hp") or state.get("current_hp") or 0)
-    damage_gap = max(incoming - current_block, 0)
-    if fallback_command.upper().startswith("POTION ") and not model_command.upper().startswith("POTION "):
-        if is_dangerous_combat(state) or damage_gap >= 22 or current_hp <= damage_gap + 18:
-            return "ignored_rule_potion"
-        return None
-    if is_gremlin_nob_fight(state):
-        model_play = parse_play_command(model_command)
-        model_card = combat_card_at(combat, model_play[0]) if model_play is not None else None
-        fallback_attack_damage = model_command_attack_damage(fallback_command, combat)
-        if (
-            model_card is not None
-            and str(model_card.get("type") or "").upper() == "SKILL"
-            and estimate_card_block(model_card) > 0
-            and fallback_attack_damage > 0
-            and current_hp > damage_gap + 10
-        ):
-            return "nob_avoid_skill_block"
-        if model_command_attack_damage(model_command, combat) > 0 and current_hp > damage_gap + 8:
-            return None
-    if damage_gap <= 0 and model_command_is_pure_block_play(model_command, combat):
-        return "no_incoming_avoid_block"
-
-    if not fallback_is_defensive_play(fallback_command, combat):
-        if model_command.upper().startswith("POTION USE") and potion_used_this_combat_turn(state):
-            return "second_potion_same_turn"
-        return None
-
-    if damage_gap < 10 and current_hp > damage_gap + 18:
-        return None
-
-    model_attack_damage = model_command_attack_damage(model_command, combat)
-    model_play = parse_play_command(model_command)
-    model_card = combat_card_at(combat, model_play[0]) if model_play is not None else None
-    if model_attack_damage > 0 and confidence >= 0.75:
-        if model_card is not None and effective_card_cost(model_card) == 0:
-            return None
-        if current_hp > damage_gap + 20:
-            return None
-
-    if (
-        is_dangerous_combat(state)
-        and current_hp > damage_gap + 30
-        and model_attack_damage >= 10
-    ):
-        return None
-
-    if model_command_is_lethal_attack(model_command, combat):
-        return None
-    if model_command_starts_turn_lethal(model_command, combat):
-        return None
-    if model_command_is_defensive_play(model_command, combat):
-        if model_command.upper().startswith("POTION USE") and potion_used_this_combat_turn(state):
-            return "second_potion_same_turn"
-        return None
-
-    return "high_incoming_prefers_defense"
+    return None
 
 
 def screen_override_reason(state: dict[str, Any], model_command: str, fallback_command: str) -> str | None:
@@ -795,7 +715,6 @@ def command_choice_index(parts: list[str]) -> int | None:
 def build_decision_payload(
     state: dict[str, Any],
     legal_actions: list[LegalAction],
-    fallback_command: str,
 ) -> dict[str, Any]:
     return {
         "policy": {
@@ -814,7 +733,6 @@ def build_decision_payload(
                 "Do not take speculative synergy cards unless the current deck already supports them.",
                 "Blessing of the Forge is not a defensive potion by itself; use it only before spending energy on cards that benefit this turn.",
                 "Use potions for lethal, elite/boss danger, or to prevent a large HP loss; do not waste them on easy turns.",
-                "Use the fallback action if it is clearly reasonable and no better legal action exists.",
             ],
         },
         "state": summarize_state(state),
@@ -822,7 +740,6 @@ def build_decision_payload(
             {"action_id": action.action_id, "command": action.command, "description": action.description}
             for action in legal_actions
         ],
-        "fallback_action": fallback_command,
     }
 
 
@@ -1120,6 +1037,8 @@ def build_legal_actions(
     state: dict[str, Any],
     available: set[str],
     fallback_command: str,
+    *,
+    include_fallback_action: bool = True,
 ) -> list[LegalAction]:
     actions: list[LegalAction] = []
 
@@ -1131,7 +1050,7 @@ def build_legal_actions(
     else:
         add_screen_actions(actions, state, available)
 
-    if command_is_available(fallback_command, available):
+    if include_fallback_action and command_is_available(fallback_command, available):
         prepend_action(actions, LegalAction("fallback", fallback_command, "Rule-based fallback action."))
 
     if "state" in available and not has_non_passive_action(actions):

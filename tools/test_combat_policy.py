@@ -213,6 +213,82 @@ class CombatPolicyTests(unittest.TestCase):
         self.assertTrue(sts_ai_player.model_command_starts_turn_lethal("PLAY 3 0", combat))
         self.assertFalse(sts_ai_player.model_command_starts_turn_lethal("PLAY 1", combat))
 
+    def test_openai_override_never_replaces_valid_llm_strategy(self):
+        state = {
+            "screen_type": "NONE",
+            "current_hp": 20,
+            "combat_state": {
+                "hand": [
+                    skill("Defend", "Defend_R"),
+                    attack("Strike", "Strike_R"),
+                ],
+                "player": {"energy": 2, "block": 0, "current_hp": 20},
+                "monsters": [
+                    {
+                        "name": "Lagavulin",
+                        "current_hp": 30,
+                        "block": 0,
+                        "intent": "ATTACK",
+                        "move_adjusted_damage": 18,
+                        "move_hits": 1,
+                    }
+                ],
+            },
+        }
+
+        self.assertIsNone(
+            sts_ai_player.openai_override_reason(
+                state,
+                model_command="PLAY 2 0",
+                fallback_command="PLAY 1",
+                decision={"confidence": 0.05},
+            )
+        )
+
+    def test_openai_override_never_replaces_valid_screen_choice(self):
+        state = {
+            "screen_type": "CARD_REWARD",
+            "screen_state": {
+                "cards": [
+                    {"id": "Perfected Strike", "name": "Perfected Strike", "type": "ATTACK", "rarity": "COMMON"},
+                    {"id": "Feed", "name": "Feed", "type": "ATTACK", "rarity": "RARE"},
+                ]
+            },
+        }
+
+        self.assertIsNone(
+            sts_ai_player.openai_override_reason(
+                state,
+                model_command="CHOOSE 0",
+                fallback_command="CHOOSE 1",
+                decision={"confidence": 0.1},
+            )
+        )
+
+    def test_openai_legal_actions_do_not_expose_rule_fallback(self):
+        state = {
+            "screen_type": "NONE",
+            "combat_state": {
+                "hand": [
+                    skill("Defend", "Defend_R"),
+                    attack("Strike", "Strike_R"),
+                ],
+                "player": {"energy": 2},
+                "monsters": [{"name": "Jaw Worm", "current_hp": 40}],
+            },
+        }
+
+        actions = sts_ai_player.build_legal_actions(
+            state,
+            {"play", "end"},
+            "PLAY 1",
+            include_fallback_action=False,
+        )
+        payload = sts_ai_player.build_decision_payload(state, actions)
+
+        self.assertNotIn("fallback", {action.action_id for action in actions})
+        self.assertNotIn("fallback_action", payload)
+
     def test_rest_prefers_heal_before_forced_elite_route(self):
         state = {
             "current_hp": 58,
