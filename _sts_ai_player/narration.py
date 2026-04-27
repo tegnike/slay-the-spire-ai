@@ -48,6 +48,8 @@ SPOKEN_NAME_REPLACEMENTS = {
     "Thunderclap": "サンダークラップ",
     "Clash": "クラッシュ",
     "Rage": "激怒",
+    "Rampage": "ランページ",
+    "Burning Pact": "燃焼契約",
     "Body Slam": "ボディスラム",
     "Blood for Blood": "血には血を",
     "Bludgeon": "強打",
@@ -113,7 +115,8 @@ SPOKEN_NAME_REPLACEMENTS = {
     "Ignore": "無視",
     "Take": "取る",
     "Leave": "離れる",
-    "Sever Soul": "セヴァーソウル",
+    "Sever Soul": "セバーソウル",
+    "Infernal Blade": "地獄の刃",
     "Fire Breathing": "炎の吐息",
     "Flex Potion": "筋力ポーション",
     "Block Potion": "ブロックポーション",
@@ -866,6 +869,13 @@ def _line_motif(text: str) -> str:
         ("みなさん", "viewer"),
         ("どうでしょう", "viewer"),
         ("登塔", "start"),
+        ("小さい敵", "finish"),
+        ("次のターンを軽く", "finish"),
+        ("点ほど受け", "damage_taken"),
+        ("次の手札で立て直", "damage_taken"),
+        ("点入れて残り体力", "damage_math"),
+        ("この一撃で残り体力", "damage_math"),
+        ("攻撃してきません", "no_incoming"),
     )
     for needle, motif in motif_rules:
         if needle in normalized:
@@ -1336,6 +1346,13 @@ EVENT_CHOICE_NAMES = {
     "ignore": "無視する",
     "take and give": "アイアンウェーブを受け取りカードを預ける",
     "take and give: receive iron wave and store a card": "アイアンウェーブを受け取りカードを預ける",
+    "agree": "同意する",
+    "disagree": "同意しない",
+    "desecrate": "冒涜する",
+    "give gold": "ゴールドを渡す",
+    "give card": "カードを渡す",
+    "attack": "攻撃する",
+    "locked": "選べない選択肢",
 }
 
 
@@ -1348,6 +1365,11 @@ def _screen_context_details(state: dict[str, Any], command: str, screen_type: st
         "choice_index": index,
         "deck_plan": _deck_plan_line(state, screen_type),
     }
+    deck_cards = _deck_cards(state)
+    details["deck_size"] = len(deck_cards)
+    details["deck_attack_count"] = sum(1 for card in deck_cards if str(card.get("type") or "").upper() == "ATTACK")
+    details["deck_skill_count"] = sum(1 for card in deck_cards if str(card.get("type") or "").upper() == "SKILL")
+    details["has_bash"] = any(str(card.get("id") or card.get("name") or "").strip().lower() == "bash" for card in deck_cards)
     if screen_type in {"CARD_REWARD", "GRID"}:
         purpose = _grid_purpose(screen_state) if screen_type == "GRID" else "reward"
         details["purpose"] = purpose
@@ -1384,11 +1406,15 @@ def _screen_context_details(state: dict[str, Any], command: str, screen_type: st
             symbol = str(node.get("symbol") or "")
             route_options.append(ROOM_SYMBOL_NAMES.get(symbol, "次の部屋"))
         details["route_options"] = route_options
+        details["route_option_count"] = len(route_options)
+        details["route_symbols"] = [str(node.get("symbol") or "") for node in nodes]
         if index is not None and 0 <= index < len(nodes):
             symbol = str(nodes[index].get("symbol") or "")
             details["choice_label"] = ROOM_SYMBOL_NAMES.get(symbol, "次の部屋")
             details["choice_key"] = f"{symbol}:{nodes[index].get('x')}:{nodes[index].get('y')}"
             details["map_symbol"] = symbol
+            details["route_x"] = nodes[index].get("x")
+            details["route_y"] = nodes[index].get("y")
     elif screen_type == "REST":
         choices = _screen_choices(state, screen_state) or [str(option) for option in screen_state.get("rest_options") or []]
         details["choice_options"] = [_choice_label(choice) for choice in choices]
@@ -1438,7 +1464,7 @@ def _screen_choices(state: dict[str, Any], screen_state: dict[str, Any]) -> list
         if isinstance(choice, str):
             choices.append(choice)
         elif isinstance(choice, dict):
-            choices.append(str(choice.get("name") or choice.get("text") or choice.get("label") or ""))
+            choices.append(str(choice.get("name") or choice.get("label") or choice.get("text") or ""))
         else:
             choices.append(str(choice))
     return [choice for choice in choices if choice]
@@ -1493,8 +1519,14 @@ def _card_pick_reason(context: dict[str, Any]) -> str:
         "flex": "このターンだけ筋力を上げます。手数が多い構成なら火力に変わります。",
         "twin strike": "二回攻撃なので筋力が乗ると伸びます。序盤の削り役です。",
         "thunderclap": "全体に弱体を付けられるので、この後の攻撃が通しやすくなります。",
+        "rampage": "使うたびに育つ攻撃です。長引く戦闘で打点が伸びます。",
+        "burning pact": "不要札を消しながら手札を増やせるので、山札の回りが良くなります。",
+        "infernal blade": "攻撃札を一枚作れるので、今のターンの打点を広げられます。",
+        "sever soul": "不要札を消しながら大きめの打点を出せます。手札整理と攻撃を兼ねる札です。",
     }
     if normalized in known_reasons:
+        if normalized == "carnage" and _safe_int(context.get("deck_size")) <= 12 and context.get("has_bash"):
+            return "まだスターター寄りなので高打点が欲しいです。バッシュの弱体に合わせると序盤戦をかなり短くできます。"
         return known_reasons[normalized]
     if card_type == "ATTACK":
         if cost == 0:
@@ -1513,6 +1545,38 @@ def _card_pick_reason(context: dict[str, Any]) -> str:
     if ethereal:
         return "手札に来たターンで使う判断が必要ですが、そのぶん瞬間的な価値があります。"
     return "今のデッキに足りない役割を埋めにいきます。"
+
+
+def _event_choice_reason(choice_label: str) -> str:
+    if choice_label == "ゴールドを渡す":
+        return "レリックに変えられるなら、今のゴールドを戦力に変える価値があります。"
+    if choice_label == "カードを渡す":
+        return "山札を薄くしながらレリックを狙えるので、対象カード次第ではかなりおいしいです。"
+    if choice_label == "攻撃する":
+        return "報酬よりリスク回避を優先して、イベントを戦闘寄りに処理します。"
+    if choice_label == "同意する":
+        return "呪いは痛いですが、序盤の買い物や削除に使えるゴールドを取りにいきます。"
+    if choice_label == "同意しない":
+        return "呪いを避けて、山札を濁さず進めます。"
+    if choice_label == "冒涜する":
+        return "呪いを背負ってでも、ゴールドの上振れを取りにいく選択です。"
+    if choice_label == "祈る":
+        return "リスクなしでゴールドを増やせるので、素直に拾います。"
+    if "最初の三戦を敵体力1" in choice_label:
+        return "序盤戦を軽く抜けて、カード報酬を見る余裕を作りたいです。"
+    if "最大体力" in choice_label:
+        return "長期戦の保険になりますが、今すぐ強くなる選択ではありません。"
+    if "ネオー" in choice_label:
+        return "まず祝福を見て、このランの方針を決めます。"
+    if choice_label == "離れる":
+        return "ここは追加リスクを取らず、次の部屋へ進みます。"
+    if choice_label == "取る":
+        return "報酬は魅力ですが、代償まで見てから踏み込みます。"
+    return "リターンと代償を比べて、今のランに合う方を取ります。"
+
+
+def _is_generic_choice_label(label: str) -> bool:
+    return not label or label == "この選択肢"
 
 
 def _choice_label(choice: str) -> str:
@@ -1560,6 +1624,7 @@ def _combat_commentary_lines(command: str, context: dict[str, Any]) -> list[str]
     if verb == "END":
         if damage_gap > 0:
             lines.append(f"ここで{damage_gap}点ほど受けます。次の手札で立て直したいですね。")
+            lines.append(f"{damage_gap}点は痛いですが、ここは受けて次のドローに託します。")
             lines.append(f"ブロックは{block}点です。被弾込みで次のターンを迎えます。")
         else:
             lines.append("被弾は抑えました。次のドローを見て攻め直します。")
@@ -1580,9 +1645,14 @@ def _combat_commentary_lines(command: str, context: dict[str, Any]) -> list[str]
 
     if "lethal" in tags:
         if target_hp > 0:
-            lines.append(f"{target_name}は残り体力{target_hp}です。ここで落とせると被弾がぐっと楽になります。")
+            if target_hp <= 1:
+                lines.append(f"{target_name}は残り1点です。小さい敵から消して、次のターンを軽くします。")
+            elif incoming > 0:
+                lines.append(f"{target_name}は残り体力{target_hp}です。先に倒せば相手の{incoming}点を減らせます。")
+            else:
+                lines.append(f"{target_name}は残り体力{target_hp}です。ここは討伐優先でテンポを取ります。")
         lines.append(f"{card_name or 'この一手'}で取り切ります。ここは逃したくない場面です。")
-        lines.append("みなさんもここは討伐優先でよさそうですかね。")
+        lines.append("守るより倒すターンですね。みなさんもここは討伐優先でよさそうですか。")
         return lines
 
     if "block" in tags:
@@ -1608,7 +1678,8 @@ def _combat_commentary_lines(command: str, context: dict[str, Any]) -> list[str]
 
     if reason == "attack":
         if incoming == 0:
-            lines.append(f"今は被弾がありません。{card_name or '攻撃'}で先に形を作ります。")
+            lines.append(f"相手は攻撃してきません。{card_name or '攻撃'}で先に形を作ります。")
+            lines.append(f"安全なターンなので、{card_name or '攻撃'}で打点を進めます。")
         elif target_hp > 0 and damage > 0:
             lines.append(
                 f"{target_name}は残り体力{target_hp}です。{damage}点入れて残り体力{max(effective_hp - damage, 0)}まで縮めます。"
@@ -1638,13 +1709,29 @@ def _screen_commentary_lines(raw: dict[str, Any], command: str, context: dict[st
     purpose = str(context.get("purpose") or "")
     lines: list[str] = []
     if screen_type == "MAP":
+        route_count = _safe_int(context.get("route_option_count"))
+        map_symbol = str(context.get("map_symbol") or "")
         if choice_label:
-            lines.append(f"みなさんなら安全寄りもありですが、次は{choice_label}へ向かいます。")
+            if route_count <= 1:
+                lines.append(f"分岐は一本道です。次は{choice_label}で、ここから展開を見ます。")
+            elif map_symbol == "E":
+                lines.append(f"ここはエリートへ踏み込みます。レリックを取りに行く勝負どころです。")
+            elif map_symbol == "R":
+                lines.append(f"次は休憩所です。回復か強化で立て直せる安心ルートですね。")
+            elif map_symbol == "?":
+                lines.append(f"次はイベントです。戦闘を避けつつ、伸びる選択肢に期待します。")
+            else:
+                lines.append(f"次は{choice_label}です。カード報酬を見てデッキを太くします。")
+        if hp is not None and max_hp is not None:
+            hp_int = _safe_int(hp)
+            max_hp_int = _safe_int(max_hp)
+            if max_hp_int > 0 and hp_int / max_hp_int <= 0.45:
+                lines.append(f"体力は{hp_int}、最大{max_hp_int}です。無理なエリートより回復先を見たいですね。")
         lines.extend(
             [
-                "次の戦闘まで見据えてルートを選びます。",
+                "この先の休憩所、ショップ、エリート位置まで見てルートを選びます。",
                 "ここから先の休憩所とエリート位置が大事になります。",
-                "みなさんなら安全寄りにしますか、それともエリートを見ますか。",
+                "戦闘でカードを増やすか、イベントでリスクを取るかの相談どころです。",
             ]
         )
         return lines
@@ -1673,10 +1760,15 @@ def _screen_commentary_lines(raw: dict[str, Any], command: str, context: dict[st
         return [line for line in lines if line]
     if screen_type == "COMBAT_REWARD":
         if choice_label:
-            lines.append(f"{choice_label}を回収します。次の部屋に向けたリソース補充です。")
+            if choice_label.startswith("ゴールド"):
+                lines.append(f"{choice_label}回収。次の買い物や削除に回します。")
+            elif "ポーション" in choice_label:
+                lines.append(f"{choice_label}を拾います。危ないターンの保険ですね。")
+            else:
+                lines.append(f"{choice_label}を回収します。次の部屋に向けたリソース補充です。")
         lines.extend(
             [
-                "戦闘後の回収です。ここで次の部屋への準備を整えます。",
+                "戦闘後の回収はテンポよく進めます。",
                 "報酬は勝ち筋に近いものから拾います。ここはテンポよくいきます。",
             ]
         )
@@ -1688,11 +1780,16 @@ def _screen_commentary_lines(raw: dict[str, Any], command: str, context: dict[st
             if sanitize_spoken_text(str(option)).strip()
         ]
         if choice_label:
-            alternatives = [option for option in choice_options if option != choice_label]
-            if alternatives:
-                lines.append(f"{_join_short(alternatives[:2])}もありますが、今回は{choice_label}を選びます。")
+            meaningful_choice = not _is_generic_choice_label(choice_label)
+            alternatives = [option for option in choice_options if option != choice_label and not _is_generic_choice_label(option)]
+            if meaningful_choice and alternatives:
+                lines.append(
+                    f"{_join_short(alternatives[:2])}もありますが、今回は{choice_label}を選びます。{_event_choice_reason(choice_label)}"
+                )
+            elif meaningful_choice:
+                lines.append(f"イベントでは{choice_label}を選びます。{_event_choice_reason(choice_label)}")
             else:
-                lines.append(f"イベントでは{choice_label}を選びます。")
+                lines.append("イベントはリターンと代償を見て、今のランに合う方を選びます。")
         if hp is not None and max_hp is not None:
             lines.append(f"体力は{hp}、最大{max_hp}です。イベントのリスクは慎重に見ます。")
         lines.append("イベントはリターンだけでなく、失うものも見て判断します。")
@@ -1762,17 +1859,40 @@ def _pre_action_lines(raw: dict[str, Any], command: str, context: dict[str, Any]
             if summaries:
                 return [
                     f"うーん、ここは悩みますね。{_join_short(summaries[:3])}で見比べます。",
+                    f"コメントなら{options[0]}派か{options[min(1, len(options) - 1)]}派か見たいですが、最後は方針で決めます。",
                 ]
             return [f"うーん、候補は{_join_short(options[:3])}です。どれを伸ばすか迷いますね。"]
     if screen_type == "EVENT":
         options = [str(option) for option in context.get("choice_options") or [] if str(option).strip()]
+        named_options = [option for option in options if not _is_generic_choice_label(option)]
         if len(options) >= 2:
-            return [f"イベント選択です。{_join_short(options[:3])}、どれも一長一短ですね。"]
+            if len(named_options) >= 2:
+                lines = [f"イベント選択です。{_join_short(named_options[:3])}、どれも一長一短ですね。"]
+            else:
+                lines = ["イベント選択です。報酬と代償を見比べる場面ですね。"]
+            if "最初の三戦を敵体力1にする祝福" in named_options and "最大体力8アップ" in named_options:
+                lines.append("コメントなら序盤安定派か、最大体力で長期戦派か割れそうです。")
+            elif len(named_options) >= 2:
+                lines.append(f"コメントなら{named_options[0]}派か{named_options[1]}派か見たい場面です。")
+            else:
+                lines.append("コメントなら安全に離れるか、上振れを取りに行くかで割れそうです。")
+            return lines
         return ["イベント選択です。リターンと失うものを見てから決めます。"]
     if screen_type == "MAP":
         options = [str(option) for option in context.get("route_options") or [] if str(option).strip()]
+        if len(options) <= 1:
+            return []
         if len(options) >= 2:
-            return [f"ルートは{_join_short(options[:4])}が見えます。安全に行くか、強くなる部屋を見るかですね。"]
+            unique_options = set(options)
+            if unique_options == {"通常戦闘"}:
+                return ["初手はどれも通常戦闘です。差は小さいので、この後の分岐と焚き火位置を見て進みます。"]
+            if "通常戦闘" in unique_options and "イベント" in unique_options:
+                return [f"ルートは{_join_short(options[:4])}が見えます。カードを取りに行くか、イベントで上振れを見るかですね。"]
+            if "エリート" in unique_options:
+                return [f"ルートは{_join_short(options[:4])}が見えます。エリートを踏むなら、その前後の回復が大事です。"]
+            return [f"ルートは{_join_short(options[:4])}が見えます。先の休憩所とショップまで見て選びます。"]
+        if choice_label:
+            return [f"ルートは一本道です。次は{choice_label}、先の分岐まで見て進みます。"]
         return ["ルート選択です。休憩所とエリート位置を先に見ます。"]
     if screen_type == "REST":
         options = [str(option) for option in context.get("choice_options") or [] if str(option).strip()]
@@ -1955,7 +2075,7 @@ def _victory_lines(raw: dict[str, Any], context: dict[str, Any]) -> list[str]:
         victory = {}
     enemies = [enemy for enemy in victory.get("enemies") or [] if isinstance(enemy, dict)]
     enemy_names = [str(enemy.get("name") or "").strip() for enemy in enemies if enemy.get("name")]
-    enemy_label = enemy_names[0] if len(enemy_names) == 1 else "敵"
+    battle_label = f"{enemy_names[0]}戦" if len(enemy_names) == 1 else "この戦闘"
     hp_after = victory.get("hp_after_reward")
     max_hp = victory.get("max_hp")
     floor = victory.get("floor") or context.get("floor")
@@ -1974,7 +2094,7 @@ def _victory_lines(raw: dict[str, Any], context: dict[str, Any]) -> list[str]:
             lines.append(f"被弾はありましたが、体力{hp_after}、最大{max_hp}で勝利です。まだ進めます。")
     lines.extend(
         [
-            f"やりました！{enemy_label}戦を突破しました。",
+            f"やりました！{battle_label}を突破しました。",
             "勝利です、報酬の前に一息つけますね。",
             "きっちり倒し切りました。次へつながります。",
         ]
@@ -2027,10 +2147,10 @@ def _max_floor_lines(raw: dict[str, Any], context: dict[str, Any]) -> list[str]:
     floor = context.get("floor")
     if floor:
         return [
-            f"{floor}階まで到達しました。設定した区切りなので、ここで一度止めます。",
+            f"{floor}階まで来ました。ここで一息、次の選択はコメントと一緒に見たいですね。",
             "ここまでの方針は確認できました。続きはルートと報酬を見て再開します。",
         ]
-    return ["設定した区切りに到達しました。ここで一度止めます。"]
+    return ["ここで一息入れます。次の選択はコメントと一緒に見たいですね。"]
 
 
 def _bridge_lines(context: dict[str, Any]) -> list[str]:

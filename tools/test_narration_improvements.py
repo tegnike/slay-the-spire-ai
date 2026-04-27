@@ -425,8 +425,7 @@ class NarrationImprovementTests(unittest.TestCase):
         recent = director.recent_texts()
 
         self.assertGreaterEqual(len(cues), 2)
-        self.assertEqual(recent[-2], cues[0]["text"])
-        self.assertEqual(recent[-1], cues[-1]["text"])
+        self.assertEqual(recent[-len(cues):], [cue["text"] for cue in cues])
 
     def test_director_rejects_model_line_that_denies_incoming_damage(self):
         director_cls = require_director(self)
@@ -474,6 +473,26 @@ class NarrationImprovementTests(unittest.TestCase):
         self.assertNotIn("無傷", cue["text"] + (cue["thought"] or ""))
         self.assertNotIn("体力を守って", cue["text"])
 
+    def test_victory_line_for_multiple_enemies_uses_natural_battle_label(self):
+        director_cls = require_director(self)
+        raw = {
+            "game_state": {"screen_type": "COMBAT_REWARD", "floor": 2, "current_hp": 80, "max_hp": 80},
+            "_sts_ai_narration_event": "combat_victory",
+            "_sts_ai_victory_context": {
+                "floor": 2,
+                "hp_after_reward": 80,
+                "max_hp": 80,
+                "enemies": [{"name": "Louse"}, {"name": "Louse"}],
+            },
+        }
+
+        cue = cue_to_dict(director_cls().choose(raw, "CHOOSE 1", None))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertIn("この戦闘", cue["text"])
+        self.assertNotIn("敵戦", cue["text"])
+
     def test_max_floor_pause_names_event_and_choices_before_generic_model_text(self):
         director_cls = require_director(self)
         raw = {
@@ -500,6 +519,202 @@ class NarrationImprovementTests(unittest.TestCase):
         self.assertIn("金の偶像", cue["text"])
         self.assertIn("取る", cue["text"])
         self.assertIn("離れる", cue["text"])
+
+    def test_route_narration_uses_specific_single_path_instead_of_generic_safety(self):
+        director_cls = require_director(self)
+        raw = screen_raw("MAP")
+        raw["game_state"]["screen_state"] = {
+            "next_nodes": [{"symbol": "?", "x": 2, "y": 1}],
+        }
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 0", "未知マスへ進みます。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertEqual(1, len(cues))
+        self.assertEqual(1, joined.count("一本道"))
+        self.assertIn("一本道", joined)
+        self.assertIn("イベント", joined)
+        self.assertNotIn("安全寄り", joined)
+
+    def test_route_narration_does_not_compare_events_when_all_routes_are_combat(self):
+        director_cls = require_director(self)
+        raw = screen_raw("MAP")
+        raw["game_state"]["screen_state"] = {
+            "next_nodes": [
+                {"symbol": "M", "x": 1, "y": 1},
+                {"symbol": "M", "x": 3, "y": 1},
+                {"symbol": "M", "x": 5, "y": 1},
+            ],
+        }
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 1", "通常戦闘へ進みます。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertIn("どれも通常戦闘", joined)
+        self.assertNotIn("イベントを見るか", joined)
+
+    def test_card_reward_sequence_invites_viewer_then_decides(self):
+        director_cls = require_director(self)
+        raw = screen_raw("CARD_REWARD")
+        raw["game_state"]["deck"] = [
+            {"id": "Strike_R", "name": "Strike", "type": "ATTACK"},
+            {"id": "Strike_R", "name": "Strike", "type": "ATTACK"},
+            {"id": "Strike_R", "name": "Strike", "type": "ATTACK"},
+            {"id": "Strike_R", "name": "Strike", "type": "ATTACK"},
+            {"id": "Defend_R", "name": "Defend", "type": "SKILL"},
+            {"id": "Defend_R", "name": "Defend", "type": "SKILL"},
+            {"id": "Defend_R", "name": "Defend", "type": "SKILL"},
+            {"id": "Defend_R", "name": "Defend", "type": "SKILL"},
+            {"id": "Bash", "name": "Bash", "type": "ATTACK"},
+        ]
+        raw["game_state"]["screen_state"] = {
+            "cards": [
+                {"id": "Headbutt", "name": "Headbutt", "type": "ATTACK", "cost": 1},
+                {"id": "Carnage", "name": "Carnage", "type": "ATTACK", "cost": 2},
+                {"id": "Pommel Strike", "name": "Pommel Strike", "type": "ATTACK", "cost": 1},
+            ]
+        }
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 1", "カードを取ります。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertGreaterEqual(len(cues), 3)
+        self.assertIn("コメントなら", joined)
+        self.assertIn("最後は方針", joined)
+        self.assertIn("カーネイジ", cues[-1]["text"])
+        self.assertIn("スターター", cues[-1]["text"])
+        self.assertIn("バッシュ", cues[-1]["text"])
+
+    def test_event_sequence_explains_neow_blessing_tradeoff(self):
+        director_cls = require_director(self)
+        raw = screen_raw("EVENT")
+        raw["game_state"]["choice_list"] = [
+            "enemies in your next three combats have 1 hp",
+            "max hp +8",
+        ]
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 0", "祝福を選びます。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertIn("序盤安定派", joined)
+        self.assertIn("最大体力", joined)
+        self.assertIn("カード報酬を見る余裕", joined)
+
+    def test_event_sequence_translates_common_event_choices_without_placeholder(self):
+        director_cls = require_director(self)
+        raw = screen_raw("EVENT")
+        raw["game_state"]["screen_state"] = {
+            "event_name": "The Ssssserpent",
+            "options": [
+                {"label": "Agree", "text": "[Agree] Gain 175 Gold. Become Cursed - Doubt."},
+                {"label": "Disagree", "text": "[Disagree]"},
+            ],
+        }
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 0", "イベントを選びます。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertIn("同意する", joined)
+        self.assertIn("同意しない", joined)
+        self.assertIn("呪い", joined)
+        self.assertNotIn("この選択肢", joined)
+
+    def test_event_sequence_translates_we_meet_again_choices(self):
+        director_cls = require_director(self)
+        raw = screen_raw("EVENT")
+        raw["game_state"]["choice_list"] = ["give gold", "give card", "attack"]
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 0", "イベントを選びます。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertIn("ゴールドを渡す", joined)
+        self.assertIn("カードを渡す", joined)
+        self.assertIn("レリック", joined)
+        self.assertNotIn("この選択肢", joined)
+
+    def test_no_incoming_attack_avoids_bad_no_damage_phrase(self):
+        director_cls = require_director(self)
+        raw = combat_raw()
+        raw["game_state"]["combat_state"]["monsters"][0]["intent"] = "BUFF"
+        raw["game_state"]["combat_state"]["monsters"][0]["current_hp"] = 42
+        raw["game_state"]["combat_state"]["monsters"][0]["move_base_damage"] = 0
+        raw["game_state"]["combat_state"]["monsters"][0]["move_adjusted_damage"] = 0
+
+        cue = cue_to_dict(director_cls().choose(raw, "PLAY 1 0", None))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertIn("攻撃してきません", cue["text"])
+        self.assertNotIn("被弾がありません", cue["text"])
+
+    def test_card_reward_translates_rampage_and_burning_pact(self):
+        director_cls = require_director(self)
+        raw = screen_raw("CARD_REWARD")
+        raw["game_state"]["screen_state"] = {
+            "cards": [
+                {"id": "Rampage", "name": "Rampage", "type": "ATTACK", "cost": 1},
+                {"id": "Burning Pact", "name": "Burning Pact", "type": "SKILL", "cost": 1},
+                {"id": "Battle Trance", "name": "Battle Trance", "type": "SKILL", "cost": 0},
+            ]
+        }
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 2", "カードを取ります。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertIn("ランページ", joined)
+        self.assertIn("燃焼契約", joined)
+        self.assertIn("バトルトランス", joined)
+        self.assertNotIn("候補はカード", joined)
+        self.assertNotIn("アクト", joined)
+
+    def test_card_reward_translates_infernal_blade_and_sever_soul(self):
+        director_cls = require_director(self)
+        raw = screen_raw("CARD_REWARD")
+        raw["game_state"]["screen_state"] = {
+            "cards": [
+                {"id": "Shrug It Off", "name": "Shrug It Off", "type": "SKILL", "cost": 1},
+                {"id": "Infernal Blade", "name": "Infernal Blade", "type": "SKILL", "cost": 1, "exhausts": True},
+                {"id": "Sever Soul", "name": "Sever Soul", "type": "ATTACK", "cost": 2},
+            ]
+        }
+
+        cues = cue_sequence_to_dicts(director_cls().choose_sequence(raw, "CHOOSE 2", "カードを取ります。"))
+        joined = "\n".join(cue["text"] for cue in cues)
+
+        self.assertIn("受け流し", joined)
+        self.assertIn("地獄の刃", joined)
+        self.assertIn("セバーソウル", joined)
+        self.assertNotIn("カードは守りや補助", joined)
+        self.assertNotIn("セァー", joined)
+
+    def test_max_floor_pause_sounds_like_stream_break_not_system_setting(self):
+        director_cls = require_director(self)
+        raw = screen_raw("COMBAT_REWARD")
+        raw["game_state"]["floor"] = 2
+        raw["_sts_ai_narration_event"] = "max_floor"
+        raw["_sts_ai_narration_mode"] = "say"
+
+        cue = cue_to_dict(director_cls().choose(raw, "WAIT 300", None))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertIn("一息", cue["text"])
+        self.assertIn("コメント", cue["text"])
+        self.assertNotIn("設定した区切り", cue["text"])
+
+    def test_gold_reward_narration_is_concise(self):
+        director_cls = require_director(self)
+        raw = screen_raw("COMBAT_REWARD")
+        raw["game_state"]["screen_state"] = {
+            "rewards": [{"reward_type": "GOLD", "gold": 20}]
+        }
+
+        cue = cue_to_dict(director_cls().choose(raw, "CHOOSE 0", None))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertIn("ゴールド20", cue["text"])
+        self.assertLessEqual(len(cue["text"]), 35)
 
     def test_director_can_stage_event_choice_with_named_options(self):
         director_cls = require_director(self)

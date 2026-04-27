@@ -678,6 +678,27 @@ class CombatPolicyTests(unittest.TestCase):
 
         self.assertGreater(sts_ai_player.rest_option_score("rest", state), sts_ai_player.rest_option_score("smith", state))
 
+    def test_max_floor_pause_waits_until_active_combat_finishes(self):
+        active_combat_raw = {
+            "game_state": {
+                "floor": 2,
+                "screen_type": "NONE",
+                "room_phase": "COMBAT",
+                "combat_state": {"monsters": [{"name": "Cultist", "current_hp": 20}]},
+            }
+        }
+        reward_raw = {
+            "game_state": {
+                "floor": 2,
+                "screen_type": "COMBAT_REWARD",
+                "room_phase": "COMPLETE",
+                "screen_state": {"rewards": []},
+            }
+        }
+
+        self.assertIsNone(sts_ai_player.pause_reason(active_combat_raw, options(max_floor=2)))
+        self.assertEqual(sts_ai_player.pause_reason(reward_raw, options(max_floor=2)), "max_floor")
+
     def test_seed_long_to_string_accepts_signed_logged_seed(self):
         self.assertEqual(sts_ai_player.seed_long_to_string(-1), "5G24A25UXKXFF")
 

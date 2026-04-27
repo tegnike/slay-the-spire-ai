@@ -159,7 +159,10 @@ def pause_reason(raw: dict[str, Any], options: Options) -> str | None:
 
     if options.max_floor is not None:
         floor = int(state.get("floor") or 0)
-        if floor >= options.max_floor:
+        combat = state.get("combat_state") if isinstance(state, dict) else {}
+        room_phase = str(state.get("room_phase") or "").upper()
+        in_active_combat = isinstance(combat, dict) and bool(combat) and screen_type in {"", "NONE"} and room_phase == "COMBAT"
+        if floor >= options.max_floor and not in_active_combat:
             logging.info("Pausing because max floor reached: floor=%s max_floor=%s", floor, options.max_floor)
             return "max_floor"
     return None
@@ -1692,10 +1695,7 @@ def run_openai_responses_api(
     logging.info("openai_api elapsed=%.2f model=%s", elapsed, options.openai_model)
     if not output_text:
         raise ValueError("OpenAI API response did not contain output text")
-    decision = json.loads(output_text)
-    if not isinstance(decision, dict):
-        raise ValueError("OpenAI API decision was not a JSON object")
-    return decision
+    return parse_json_object_text(output_text)
 
 
 def run_openai_narration_api(
@@ -1795,10 +1795,7 @@ def run_openai_narration_api(
     logging.info("openai_pause_narration elapsed=%.2f model=%s", elapsed, options.openai_model)
     if not output_text:
         raise ValueError("OpenAI pause narration response did not contain output text")
-    decision = json.loads(output_text)
-    if not isinstance(decision, dict):
-        raise ValueError("OpenAI pause narration decision was not a JSON object")
-    return decision
+    return parse_json_object_text(output_text)
 
 
 def extract_response_text(response: dict[str, Any]) -> str:
@@ -1815,6 +1812,14 @@ def extract_response_text(response: dict[str, Any]) -> str:
             if isinstance(text, str):
                 texts.append(text)
     return "".join(texts).strip()
+
+
+def parse_json_object_text(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    value, _ = decoder.raw_decode(text.strip())
+    if not isinstance(value, dict):
+        raise ValueError("OpenAI decision was not a JSON object")
+    return value
 
 
 def fallback_is_defensive_play(command: str, combat: dict[str, Any]) -> bool:
