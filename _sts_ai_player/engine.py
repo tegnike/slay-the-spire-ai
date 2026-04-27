@@ -44,6 +44,7 @@ OPENAI_API_DISABLED_REASON: str | None = None
 OPENAI_API_LAST_ERROR: str | None = None
 POTION_USED_TURNS: set[tuple[str, int, int, int]] = set()
 LAST_CHOSEN_MAP_NODE: dict[str, Any] | None = None
+OFFICIAL_NARRATION_EMOTIONS = {"neutral", "happy", "angry", "sad", "thinking"}
 
 SHOP_VISITED_KEYS: set[tuple[str, int, int]] = set()
 
@@ -519,6 +520,7 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
         action_payload,
         fallback_command,
         include_narration=options.narration_ui,
+        recent_narrations=normalize_recent_narrations(raw.get("_sts_ai_recent_narrations")),
     )
     decision = run_codex_cli(prompt, options)
     action_id = str(decision.get("action_id") or "")
@@ -530,8 +532,14 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
 
     raw["_sts_ai_action_description"] = action.description
     narration_text = normalize_narration_text(decision.get("narration_text")) if options.narration_ui else None
+    narration_mode = normalize_narration_mode(decision.get("narration_mode")) if options.narration_ui else None
+    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) if options.narration_ui else None
     if narration_text:
         raw["_sts_ai_narration_text"] = narration_text
+    if narration_mode:
+        raw["_sts_ai_narration_mode"] = narration_mode
+    if narration_emotion:
+        raw["_sts_ai_narration_emotion"] = narration_emotion
     append_jsonl(
         "codex_decisions.jsonl",
         {
@@ -542,7 +550,9 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
             "action_id": action.action_id,
             "command": action.command,
             "rationale": decision.get("rationale"),
+            "narration_mode": narration_mode,
             "narration_text": narration_text,
+            "narration_emotion": narration_emotion,
             "fallback": fallback_command,
         },
     )
@@ -572,6 +582,7 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
         state,
         legal_actions,
         include_narration=options.narration_ui,
+        recent_narrations=normalize_recent_narrations(raw.get("_sts_ai_recent_narrations")),
     )
     append_jsonl(
         "openai_requests.jsonl",
@@ -617,8 +628,14 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
 
     raw["_sts_ai_action_description"] = action_description_for_command(legal_actions, final_command) or action.description
     narration_text = normalize_narration_text(decision.get("narration_text")) if options.narration_ui else None
+    narration_mode = normalize_narration_mode(decision.get("narration_mode")) if options.narration_ui else None
+    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) if options.narration_ui else None
     if narration_text:
         raw["_sts_ai_narration_text"] = narration_text
+    if narration_mode:
+        raw["_sts_ai_narration_mode"] = narration_mode
+    if narration_emotion:
+        raw["_sts_ai_narration_emotion"] = narration_emotion
     append_jsonl(
         "openai_decisions.jsonl",
         {
@@ -630,7 +647,9 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
             "command": final_command,
             "model_command": action.command,
             "rationale": decision.get("rationale"),
+            "narration_mode": narration_mode,
             "narration_text": narration_text,
+            "narration_emotion": narration_emotion,
             "confidence": decision.get("confidence"),
             "fallback": fallback_command,
             "override_reason": override_reason,
@@ -736,6 +755,8 @@ def build_decision_payload(
     legal_actions: list[LegalAction],
     *,
     include_narration: bool = False,
+    recent_narrations: list[str] | None = None,
+    recent_narration_examples: list[str] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "policy": {
@@ -764,20 +785,26 @@ def build_decision_payload(
     }
     if include_narration:
         payload["narration"] = {
-            "required_field": "narration_text",
+            "required_fields": ["narration_mode", "narration_text", "narration_emotion"],
             "style": [
-                "Write one short Japanese spoken line for a game commentator.",
-                "Keep it natural and energetic, not explanatory.",
+                "Choose narration_mode=say for moments worth hearing, or silent for low-value repeated transitions.",
+                "When saying something, write one short Japanese spoken line for a game commentator.",
+                "Keep it natural, reactive, and energetic, not explanatory.",
                 "Do not include the rationale, chain-of-thought, action_id, command syntax, or English strategic analysis.",
                 "Mention the concrete move or situation in plain Japanese.",
+                "Avoid repeating recent_examples. Use short hype lines like よっしゃ！ or いけーー！ when the moment is exciting.",
+                "Use narration_emotion as one of neutral, happy, angry, sad, thinking.",
                 "Aim for 12 to 35 Japanese characters. Maximum 60 characters.",
             ],
             "examples": [
-                "ここはストライクで削ります。",
-                "最大HPを取って安定させます。",
-                "ブロックより先に倒し切ります。",
+                {"narration_mode": "say", "narration_text": "いけーー！ここで倒し切る！", "narration_emotion": "happy"},
+                {"narration_mode": "say", "narration_text": "うわ、ここは踏ん張りどころ。", "narration_emotion": "sad"},
+                {"narration_mode": "silent", "narration_text": "", "narration_emotion": "neutral"},
             ],
         }
+        recent_examples = recent_narration_examples or recent_narrations or []
+        if recent_examples:
+            payload["narration"]["recent_examples"] = recent_examples[-8:]
     return payload
 
 
@@ -787,6 +814,8 @@ def build_codex_prompt(
     fallback_command: str,
     *,
     include_narration: bool = False,
+    recent_narrations: list[str] | None = None,
+    recent_narration_examples: list[str] | None = None,
 ) -> str:
     payload = {
         "state": summarize_state(state),
@@ -795,15 +824,21 @@ def build_codex_prompt(
     }
     if include_narration:
         payload["narration"] = {
-            "required_field": "narration_text",
+            "required_fields": ["narration_mode", "narration_text", "narration_emotion"],
             "style": (
-                "One short Japanese spoken commentator line, 12-35 characters when possible. "
-                "Do not include rationale, command syntax, or English analysis."
+                "Use narration_mode=say or silent. If say, write one short Japanese spoken commentator line, "
+                "12-35 characters when possible, with reactive variety and occasional hype like よっしゃ！ or いけーー！. "
+                "Avoid recent_examples. Do not include rationale, command syntax, or English analysis. "
+                "Use narration_emotion as neutral, happy, angry, sad, or thinking."
             ),
         }
+        recent_examples = recent_narration_examples or recent_narrations or []
+        if recent_examples:
+            payload["narration"]["recent_examples"] = recent_examples[-8:]
     shape = (
         '{"action_id":"<one legal action_id>","rationale":"<brief reason>",'
-        '"narration_text":"<short Japanese spoken line>"}'
+        '"narration_mode":"say|silent","narration_text":"<short Japanese spoken line or empty>",'
+        '"narration_emotion":"neutral|happy|angry|sad|thinking"}'
         if include_narration
         else '{"action_id":"<one legal action_id>","rationale":"<brief reason>"}'
     )
@@ -879,11 +914,21 @@ def run_openai_responses_api(
     }
     required = ["action_id", "rationale", "confidence"]
     if options.narration_ui:
+        properties["narration_mode"] = {
+            "type": "string",
+            "enum": ["say", "silent"],
+            "description": "Whether this action deserves spoken narration or should be intentionally silent.",
+        }
         properties["narration_text"] = {
             "type": "string",
-            "description": "One short, natural Japanese spoken commentary line for the chosen action.",
+            "description": "One short, natural Japanese spoken commentary line, or empty when narration_mode is silent.",
         }
-        required.append("narration_text")
+        properties["narration_emotion"] = {
+            "type": "string",
+            "enum": ["neutral", "happy", "angry", "sad", "thinking"],
+            "description": "Emotion sent to the narration runtime UI.",
+        }
+        required.extend(["narration_mode", "narration_text", "narration_emotion"])
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -896,9 +941,10 @@ def run_openai_responses_api(
     )
     if options.narration_ui:
         system_prompt += (
-            " Also write narration_text as a separate short Japanese line for a live game narrator. "
-            "It must be natural spoken commentary, not a rationale, and must not include English analysis "
-            "or command syntax."
+            " Also choose narration_mode, narration_text, and narration_emotion for a live game narrator. "
+            "Use silent for low-value repeated transitions. Spoken lines must be natural Japanese commentary, "
+            "not rationale, and must not include English analysis or command syntax. Use only the official "
+            "emotions neutral, happy, angry, sad, and thinking."
         )
     request_body = {
         "model": options.openai_model,
@@ -1079,8 +1125,10 @@ def write_codex_output_schema(*, include_narration: bool = False) -> str:
     }
     required = ["action_id", "rationale"]
     if include_narration:
+        properties["narration_mode"] = {"type": "string", "enum": ["say", "silent"]}
         properties["narration_text"] = {"type": "string"}
-        required.append("narration_text")
+        properties["narration_emotion"] = {"type": "string", "enum": ["neutral", "happy", "angry", "sad", "thinking"]}
+        required.extend(["narration_mode", "narration_text", "narration_emotion"])
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -1104,6 +1152,37 @@ def normalize_narration_text(value: Any) -> str | None:
     if len(text) > 80:
         text = text[:80].rstrip("、。,. ") + "。"
     return text
+
+
+def normalize_narration_mode(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    mode = value.strip().lower()
+    if mode in {"say", "silent"}:
+        return mode
+    return None
+
+
+def normalize_narration_emotion(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    emotion = value.strip().lower()
+    aliases = {"normal": "neutral", "joy": "happy", "excited": "happy", "surprised": "happy"}
+    emotion = aliases.get(emotion, emotion)
+    if emotion in OFFICIAL_NARRATION_EMOTIONS:
+        return emotion
+    return None
+
+
+def normalize_recent_narrations(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    recent: list[str] = []
+    for item in value:
+        text = normalize_narration_text(item)
+        if text:
+            recent.append(text)
+    return recent[-8:]
 
 
 def parse_codex_json(text: str) -> dict[str, Any]:

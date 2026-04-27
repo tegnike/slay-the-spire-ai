@@ -11,7 +11,7 @@ import time
 
 from . import engine
 from .models import Options
-from .narration import NarrationUIClient, build_narration_text, should_narrate_command
+from .narration import OFFICIAL_EMOTIONS, NarrationDirector, NarrationUIClient
 
 
 def run_protocol(options: Options) -> int:
@@ -28,6 +28,7 @@ def run_protocol(options: Options) -> int:
         if options.narration_ui
         else None
     )
+    narration_director = NarrationDirector() if narration_client is not None else None
     print("ready", flush=True)
 
     try:
@@ -48,30 +49,85 @@ def run_protocol(options: Options) -> int:
                 payload["_sts_ai_log_index"] = state_index
                 payload["_sts_ai_process_id"] = process_id
                 payload["_sts_ai_received_at"] = time.time()
+                if narration_director is not None:
+                    payload["_sts_ai_recent_narrations"] = narration_director.recent_texts()
                 engine.append_jsonl("states.jsonl", payload)
                 command = engine.choose_command(payload, options)
                 engine.remember_potion_use(command, payload)
 
             narration_status = None
+            narration_status_reason = None
             narration_text = None
-            if narration_client is not None and payload is not None and should_narrate_command(command):
-                text = str(payload.get("_sts_ai_narration_text") or "").strip() or build_narration_text(payload, command)
-                narration_text = text
-                narration_status = narration_client.say(
-                    text,
-                    metadata={
-                        "source": "slay-the-spire-ai",
-                        "state_index": state_index,
-                        "process_id": process_id,
-                        "command": command,
-                    },
+            narration_emotion = None
+            narration_style = None
+            if narration_client is not None and narration_director is not None and payload is not None:
+                cue = narration_director.choose(
+                    payload,
+                    command,
+                    str(payload.get("_sts_ai_narration_text") or "").strip() or None,
                 )
+                if cue is None:
+                    suppression_reason = narration_director.last_suppression_reason() or "producer_suppressed"
+                    if suppression_reason == "non_speech_command":
+                        narration_status = "suppressed"
+                        narration_status_reason = suppression_reason
+                    else:
+                        narration_status = narration_client.suppress(
+                            narration_director.last_suppression_text() or "Producer suppressed low-value narration.",
+                            reason=suppression_reason,
+                            metadata={
+                                "source": "slay-the-spire-ai",
+                                "state_index": state_index,
+                                "process_id": process_id,
+                                "command": command,
+                            },
+                        )
+                        narration_status_reason = narration_client.last_status_reason
+                else:
+                    narration_text = cue.text
+                    narration_emotion = str(payload.get("_sts_ai_narration_emotion") or cue.emotion)
+                    if narration_emotion not in OFFICIAL_EMOTIONS:
+                        narration_emotion = cue.emotion
+                    narration_style = {
+                        "pace": cue.pace,
+                        "intensity": cue.intensity,
+                        "priority": cue.priority,
+                        "queue_policy": cue.queue_policy,
+                        "max_queue_ms": cue.max_queue_ms,
+                        "subtitle_only": cue.subtitle_only,
+                    }
+                    narration_status = narration_client.say(
+                        cue.text,
+                        emotion=narration_emotion,
+                        pace=cue.pace,
+                        intensity=cue.intensity,
+                        priority=cue.priority,
+                        queue_policy=cue.queue_policy,
+                        max_queue_ms=cue.max_queue_ms,
+                        subtitle_only=cue.subtitle_only,
+                        interrupt=cue.interrupt,
+                        metadata={
+                            "source": "slay-the-spire-ai",
+                            "state_index": state_index,
+                            "process_id": process_id,
+                            "command": command,
+                            "narration_reason": cue.reason,
+                            "narration_importance": cue.importance,
+                        },
+                    )
+                    narration_status_reason = narration_client.last_status_reason
 
             action = {"time": time.time(), "state_index": state_index, "process_id": process_id, "command": command}
             if narration_status:
                 action["narration_status"] = narration_status
+            if narration_status_reason:
+                action["narration_status_reason"] = narration_status_reason
             if narration_text:
                 action["narration_text"] = narration_text
+            if narration_emotion:
+                action["narration_emotion"] = narration_emotion
+            if narration_style:
+                action["narration_style"] = narration_style
             engine.append_jsonl("actions.jsonl", action)
             logging.info("command=%s", command)
             print(command, flush=True)

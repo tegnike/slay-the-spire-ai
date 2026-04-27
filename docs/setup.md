@@ -120,7 +120,11 @@ python3 tools/configure_communication_mod.py --with-narration-ui
 
 relay URL を変える場合は `--narration-url ws://localhost:3010/ws/narration` を指定します。デフォルトではUI側の再生完了通知を待ってからゲームコマンドを返します。進行速度を優先する場合はAIコマンドへ `--narration-no-wait` を付けてください。
 
-このオプションが有効なときだけ、OpenAI / Codex へのプロンプトに短い実況文 `narration_text` の生成指示を追加します。送信した本文は `actions.jsonl` に、モデルが生成した本文は `openai_decisions.jsonl` または `codex_decisions.jsonl` に記録されます。
+このオプションが有効なときだけ、OpenAI / Codex へのプロンプトに短い実況用の `narration_mode` / `narration_text` / `narration_emotion` の生成指示を追加します。送信した本文は `actions.jsonl` に、モデルが生成した本文は `openai_decisions.jsonl` または `codex_decisions.jsonl` に記録されます。
+
+ナレーション送信時は、価値の低い進行報告や同じ意味の反復文をスキップすることがあります。直近に送った実況文の履歴を使って重複を抑え、ナレーション runtime UI へは本文と一緒に公式 emotion の `neutral` / `happy` / `angry` / `sad` / `thinking` のいずれかを送ります。
+
+更新後の narration runtime では、`pace` / `intensity` / `priority` / `queuePolicy` / `maxQueueMs` も送ります。リーサルや危険ターンは `replaceIfHigherPriority` で優先し、低価値な遷移は `dropIfBusy` でキューを詰まらせないようにします。発話しない判断も `narration:suppressed` として relay に通知し、`skipped` / `failed` の `reason` は `actions.jsonl` に記録します。
 
 ## 5. 起動手順
 

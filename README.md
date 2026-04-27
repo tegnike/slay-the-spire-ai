@@ -63,6 +63,12 @@ OpenAI API まで含めて確認する場合:
 OPENAI_API_KEY="..." python3 sts_ai_player.py --test --use-openai-api --openai-model gpt-5.4-mini
 ```
 
+ローカルのユニットテストをまとめて確認する場合:
+
+```bash
+python3 -m unittest discover -s tools -p 'test_*.py'
+```
+
 ### 2. CommunicationMod 設定を作る
 
 通常プレイでは、CommunicationMod が起動する AI コマンドを設定ファイルに書きます。
@@ -176,7 +182,11 @@ python3 sts_ai_player.py --auto-start --use-openai-api --openai-model gpt-5-mini
 python3 tools/configure_communication_mod.py --with-narration-ui
 ```
 
-`--narration-ui` を付けた場合だけ、OpenAI / Codex に短い実況用 `narration_text` も生成させ、`ws://localhost:3010/ws/narration` へ送ります。通常時の判断プロンプトや進行速度には影響しません。送信文は `actions.jsonl` に保存されます。
+`--narration-ui` を付けた場合だけ、OpenAI / Codex に短い実況用の `narration_mode` / `narration_text` / `narration_emotion` も生成させ、`ws://localhost:3010/ws/narration` へ送ります。通常時の判断プロンプトや進行速度には影響しません。送信文は `actions.jsonl` に保存されます。
+
+ナレーションは、低価値な進行報告や直前と似た反復文を送らない場合があります。最近送った文の履歴を見て重複を抑え、runtime UI には本文とあわせて公式 emotion の `neutral` / `happy` / `angry` / `sad` / `thinking` のいずれかを送ります。
+
+runtime UI が対応している場合は、場面に応じて `pace` / `intensity` / `priority` / `queuePolicy` / `maxQueueMs` も送ります。リーサルや危険ターンは高優先度で速く強めに、低価値な遷移は `dropIfBusy` で落としやすくします。抑制した実況は `narration:suppressed` として relay へ通知し、relay から返る `skipped` / `failed` の `reason` は `actions.jsonl` に保存します。
 
 詳細は [docs/setup.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/setup.md) を参照してください。
 
