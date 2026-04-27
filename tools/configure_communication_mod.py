@@ -16,6 +16,16 @@ DEFAULT_COMMAND = f"python3 {ROOT / 'sts_ai_player.py'} --auto-start --use-opena
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--command", default=DEFAULT_COMMAND)
+    parser.add_argument(
+        "--with-narration-ui",
+        action="store_true",
+        help="Append --narration-ui to the default AI command.",
+    )
+    parser.add_argument(
+        "--narration-url",
+        default=None,
+        help="Optional narration relay URL appended with --with-narration-ui.",
+    )
     parser.add_argument("--config-path", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -27,9 +37,14 @@ def escape_properties_value(value: str) -> str:
 
 def main() -> int:
     args = parse_args()
+    command = args.command
+    if args.with_narration_ui:
+        command += " --narration-ui"
+        if args.narration_url:
+            command += f" --narration-url {args.narration_url}"
     body = "\n".join(
         [
-            f"command={escape_properties_value(args.command)}",
+            f"command={escape_properties_value(command)}",
             "runAtGameStart=true",
             "verbose=false",
             "maxInitializationTimeout=10",
@@ -38,7 +53,7 @@ def main() -> int:
     )
 
     print(f"Config path: {args.config_path}")
-    print(f"Command: {args.command}")
+    print(f"Command: {command}")
 
     if args.dry_run:
         print(body, end="")

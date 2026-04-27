@@ -107,6 +107,21 @@ OPENAI_API_KEY="..." ./run_modded.sh
 python3 tools/configure_communication_mod.py --command 'python3 /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/sts_ai_player.py --auto-start --use-openai-api --openai-model gpt-5-mini'
 ```
 
+`ai-agent-game-streamer` のナレーション runtime UI と接続する場合は、先に relay/UI を起動してから、AIコマンドに `--narration-ui` を追加します。
+
+```bash
+cd /Users/user/WorkSpace/ai-agent-game-streamer
+npm run narration:relay
+npm run narration:dev
+
+cd /Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai
+python3 tools/configure_communication_mod.py --with-narration-ui
+```
+
+relay URL を変える場合は `--narration-url ws://localhost:3010/ws/narration` を指定します。デフォルトではUI側の再生完了通知を待ってからゲームコマンドを返します。進行速度を優先する場合はAIコマンドへ `--narration-no-wait` を付けてください。
+
+このオプションが有効なときだけ、OpenAI / Codex へのプロンプトに短い実況文 `narration_text` の生成指示を追加します。送信した本文は `actions.jsonl` に、モデルが生成した本文は `openai_decisions.jsonl` または `codex_decisions.jsonl` に記録されます。
+
 ## 5. 起動手順
 
 1. Slay the Spireを終了する

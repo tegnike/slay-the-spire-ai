@@ -514,7 +514,12 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
         {"action_id": action.action_id, "command": action.command, "description": action.description}
         for action in legal_actions
     ]
-    prompt = build_codex_prompt(state, action_payload, fallback_command)
+    prompt = build_codex_prompt(
+        state,
+        action_payload,
+        fallback_command,
+        include_narration=options.narration_ui,
+    )
     decision = run_codex_cli(prompt, options)
     action_id = str(decision.get("action_id") or "")
     by_id = {action.action_id: action for action in legal_actions}
@@ -523,6 +528,10 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
         logging.warning("Codex returned illegal action_id=%s", action_id)
         return fallback_command
 
+    raw["_sts_ai_action_description"] = action.description
+    narration_text = normalize_narration_text(decision.get("narration_text")) if options.narration_ui else None
+    if narration_text:
+        raw["_sts_ai_narration_text"] = narration_text
     append_jsonl(
         "codex_decisions.jsonl",
         {
@@ -533,6 +542,7 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
             "action_id": action.action_id,
             "command": action.command,
             "rationale": decision.get("rationale"),
+            "narration_text": narration_text,
             "fallback": fallback_command,
         },
     )
@@ -558,7 +568,11 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
     if not legal_actions:
         return fallback_command
 
-    decision_payload = build_decision_payload(state, legal_actions)
+    decision_payload = build_decision_payload(
+        state,
+        legal_actions,
+        include_narration=options.narration_ui,
+    )
     append_jsonl(
         "openai_requests.jsonl",
         {
@@ -601,6 +615,10 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
         )
         final_command = fallback_command
 
+    raw["_sts_ai_action_description"] = action_description_for_command(legal_actions, final_command) or action.description
+    narration_text = normalize_narration_text(decision.get("narration_text")) if options.narration_ui else None
+    if narration_text:
+        raw["_sts_ai_narration_text"] = narration_text
     append_jsonl(
         "openai_decisions.jsonl",
         {
@@ -612,6 +630,7 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
             "command": final_command,
             "model_command": action.command,
             "rationale": decision.get("rationale"),
+            "narration_text": narration_text,
             "confidence": decision.get("confidence"),
             "fallback": fallback_command,
             "override_reason": override_reason,
@@ -715,8 +734,10 @@ def command_choice_index(parts: list[str]) -> int | None:
 def build_decision_payload(
     state: dict[str, Any],
     legal_actions: list[LegalAction],
+    *,
+    include_narration: bool = False,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "policy": {
             "objective": "Win the run. Preserve HP, but recognize that faster kills are often the best HP preservation in Act 1.",
             "constraints": [
@@ -741,22 +762,55 @@ def build_decision_payload(
             for action in legal_actions
         ],
     }
+    if include_narration:
+        payload["narration"] = {
+            "required_field": "narration_text",
+            "style": [
+                "Write one short Japanese spoken line for a game commentator.",
+                "Keep it natural and energetic, not explanatory.",
+                "Do not include the rationale, chain-of-thought, action_id, command syntax, or English strategic analysis.",
+                "Mention the concrete move or situation in plain Japanese.",
+                "Aim for 12 to 35 Japanese characters. Maximum 60 characters.",
+            ],
+            "examples": [
+                "ここはストライクで削ります。",
+                "最大HPを取って安定させます。",
+                "ブロックより先に倒し切ります。",
+            ],
+        }
+    return payload
 
 
 def build_codex_prompt(
     state: dict[str, Any],
     legal_actions: list[dict[str, str]],
     fallback_command: str,
+    *,
+    include_narration: bool = False,
 ) -> str:
     payload = {
         "state": summarize_state(state),
         "legal_actions": legal_actions,
         "fallback_action": fallback_command,
     }
+    if include_narration:
+        payload["narration"] = {
+            "required_field": "narration_text",
+            "style": (
+                "One short Japanese spoken commentator line, 12-35 characters when possible. "
+                "Do not include rationale, command syntax, or English analysis."
+            ),
+        }
+    shape = (
+        '{"action_id":"<one legal action_id>","rationale":"<brief reason>",'
+        '"narration_text":"<short Japanese spoken line>"}'
+        if include_narration
+        else '{"action_id":"<one legal action_id>","rationale":"<brief reason>"}'
+    )
     return (
         "You are choosing one Slay the Spire action from a fixed legal action list.\n"
         "Return only JSON with this exact shape: "
-        '{"action_id":"<one legal action_id>","rationale":"<brief reason>"}.\n'
+        f"{shape}.\n"
         "The action_id must exactly match one legal_actions entry. Do not invent commands.\n\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
@@ -764,7 +818,7 @@ def build_codex_prompt(
 
 def run_codex_cli(prompt: str, options: Options) -> dict[str, Any]:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    schema_path = write_codex_output_schema()
+    schema_path = write_codex_output_schema(include_narration=options.narration_ui)
     output_path = tempfile.NamedTemporaryFile(
         prefix="sts-codex-output-",
         suffix=".json",
@@ -818,25 +872,40 @@ def run_openai_responses_api(
     options: Options,
     api_key: str,
 ) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "action_id": {"type": "string", "enum": action_ids},
+        "rationale": {"type": "string"},
+        "confidence": {"type": "number"},
+    }
+    required = ["action_id", "rationale", "confidence"]
+    if options.narration_ui:
+        properties["narration_text"] = {
+            "type": "string",
+            "description": "One short, natural Japanese spoken commentary line for the chosen action.",
+        }
+        required.append("narration_text")
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {
-            "action_id": {"type": "string", "enum": action_ids},
-            "rationale": {"type": "string"},
-            "confidence": {"type": "number"},
-        },
-        "required": ["action_id", "rationale", "confidence"],
+        "properties": properties,
+        "required": required,
     }
+    system_prompt = (
+        "You are a Slay the Spire policy engine. Choose one action_id from the provided "
+        "legal_actions. Return only the structured JSON object. Do not invent actions."
+    )
+    if options.narration_ui:
+        system_prompt += (
+            " Also write narration_text as a separate short Japanese line for a live game narrator. "
+            "It must be natural spoken commentary, not a rationale, and must not include English analysis "
+            "or command syntax."
+        )
     request_body = {
         "model": options.openai_model,
         "input": [
             {
                 "role": "system",
-                "content": (
-                    "You are a Slay the Spire policy engine. Choose one action_id from the provided "
-                    "legal_actions. Return only the structured JSON object. Do not invent actions."
-                ),
+                "content": system_prompt,
             },
             {
                 "role": "user",
@@ -851,7 +920,7 @@ def run_openai_responses_api(
                 "schema": schema,
             }
         },
-        "max_output_tokens": 300,
+        "max_output_tokens": 450 if options.narration_ui else 300,
         "store": False,
     }
 
@@ -1003,19 +1072,38 @@ def combat_monster_at(combat: dict[str, Any], index: int) -> dict[str, Any] | No
     return monster if isinstance(monster, dict) else None
 
 
-def write_codex_output_schema() -> str:
+def write_codex_output_schema(*, include_narration: bool = False) -> str:
+    properties = {
+        "action_id": {"type": "string"},
+        "rationale": {"type": "string"},
+    }
+    required = ["action_id", "rationale"]
+    if include_narration:
+        properties["narration_text"] = {"type": "string"}
+        required.append("narration_text")
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {
-            "action_id": {"type": "string"},
-            "rationale": {"type": "string"},
-        },
-        "required": ["action_id", "rationale"],
+        "properties": properties,
+        "required": required,
     }
     path = LOG_DIR / "codex_action_schema.json"
     path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
     return str(path)
+
+
+def normalize_narration_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text:
+        return None
+    forbidden_markers = ("action_id", "PLAY ", "CHOOSE ", "END", "STATE", "rationale")
+    for marker in forbidden_markers:
+        text = text.replace(marker, "").strip()
+    if len(text) > 80:
+        text = text[:80].rstrip("、。,. ") + "。"
+    return text
 
 
 def parse_codex_json(text: str) -> dict[str, Any]:
@@ -1665,6 +1753,13 @@ def dedupe_actions(actions: list[LegalAction]) -> list[LegalAction]:
         seen_commands.add(action.command)
         result.append(action)
     return result
+
+
+def action_description_for_command(actions: list[LegalAction], command: str) -> str | None:
+    for action in actions:
+        if action.command == command:
+            return action.description
+    return None
 
 
 def estimate_incoming_damage(monsters: list[dict[str, Any]]) -> int:

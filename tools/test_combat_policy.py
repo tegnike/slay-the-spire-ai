@@ -288,6 +288,37 @@ class CombatPolicyTests(unittest.TestCase):
 
         self.assertNotIn("fallback", {action.action_id for action in actions})
         self.assertNotIn("fallback_action", payload)
+        self.assertNotIn("narration", payload)
+
+    def test_narration_prompt_only_when_enabled(self):
+        state = {
+            "screen_type": "NONE",
+            "combat_state": {
+                "hand": [attack("Strike", "Strike_R")],
+                "player": {"energy": 1},
+                "monsters": [{"name": "Jaw Worm", "current_hp": 40}],
+            },
+        }
+        actions = sts_ai_player.build_legal_actions(state, {"play", "end"}, "PLAY 1 0", include_fallback_action=False)
+
+        without_narration = sts_ai_player.build_decision_payload(state, actions)
+        with_narration = sts_ai_player.build_decision_payload(state, actions, include_narration=True)
+        codex_without = sts_ai_player.build_codex_prompt(
+            state,
+            [{"action_id": action.action_id, "command": action.command, "description": action.description} for action in actions],
+            "PLAY 1 0",
+        )
+        codex_with = sts_ai_player.build_codex_prompt(
+            state,
+            [{"action_id": action.action_id, "command": action.command, "description": action.description} for action in actions],
+            "PLAY 1 0",
+            include_narration=True,
+        )
+
+        self.assertNotIn("narration", without_narration)
+        self.assertIn("narration", with_narration)
+        self.assertNotIn("narration_text", codex_without)
+        self.assertIn("narration_text", codex_with)
 
     def test_rest_prefers_heal_before_forced_elite_route(self):
         state = {

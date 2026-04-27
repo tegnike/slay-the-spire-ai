@@ -21,6 +21,11 @@ class Options:
     codex_model: str
     codex_command: str
     codex_timeout: float
+    narration_ui: bool
+    narration_url: str
+    narration_speaker: str
+    narration_wait: bool
+    narration_timeout: float
 
 
 @dataclass(frozen=True)

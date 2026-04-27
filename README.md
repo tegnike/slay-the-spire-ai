@@ -10,6 +10,7 @@ Slay the Spire
   -> stdin/stdout
   -> sts_ai_player.py
   -> OpenAI API or rule-based policy
+  -> optional WebSocket narration relay + narration UI
 ```
 
 現在の主目的は、勝率最適化ではなく「ゲームと AI 判断ループを安定して接続し、ランを自動進行させる」ことです。
@@ -166,6 +167,18 @@ python3 sts_ai_player.py --auto-start --use-openai-api --openai-model gpt-5-mini
 ```
 
 設定ファイルに反映する場合は `tools/configure_communication_mod.py --command '...'` で上記コマンドを指定します。
+
+## ナレーション UI 連携
+
+個人配信用の実験オプションとして、`ai-agent-game-streamer` のナレーション runtime UI へ実況文を送れます。通常プレイでは不要です。
+
+```bash
+python3 tools/configure_communication_mod.py --with-narration-ui
+```
+
+`--narration-ui` を付けた場合だけ、OpenAI / Codex に短い実況用 `narration_text` も生成させ、`ws://localhost:3010/ws/narration` へ送ります。通常時の判断プロンプトや進行速度には影響しません。送信文は `actions.jsonl` に保存されます。
+
+詳細は [docs/setup.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/setup.md) を参照してください。
 
 ## 確認済みの到達点
 

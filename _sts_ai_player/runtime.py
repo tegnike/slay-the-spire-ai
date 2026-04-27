@@ -11,38 +11,73 @@ import time
 
 from . import engine
 from .models import Options
+from .narration import NarrationUIClient, build_narration_text, should_narrate_command
 
 
 def run_protocol(options: Options) -> int:
     engine.setup_logging()
     process_id = os.getpid()
     logging.info("AI process started pid=%s", process_id)
+    narration_client = (
+        NarrationUIClient(
+            url=options.narration_url,
+            speaker=options.narration_speaker,
+            wait_for_completion=options.narration_wait,
+            timeout=options.narration_timeout,
+        )
+        if options.narration_ui
+        else None
+    )
     print("ready", flush=True)
 
-    state_index = 0
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
+    try:
+        state_index = 0
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
 
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            logging.exception("Invalid JSON from CommunicationMod")
-            command = "STATE"
-        else:
-            state_index += 1
-            payload["_sts_ai_log_index"] = state_index
-            payload["_sts_ai_process_id"] = process_id
-            payload["_sts_ai_received_at"] = time.time()
-            engine.append_jsonl("states.jsonl", payload)
-            command = engine.choose_command(payload, options)
-            engine.remember_potion_use(command, payload)
+            payload: dict[str, object] | None = None
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                logging.exception("Invalid JSON from CommunicationMod")
+                command = "STATE"
+            else:
+                state_index += 1
+                payload["_sts_ai_log_index"] = state_index
+                payload["_sts_ai_process_id"] = process_id
+                payload["_sts_ai_received_at"] = time.time()
+                engine.append_jsonl("states.jsonl", payload)
+                command = engine.choose_command(payload, options)
+                engine.remember_potion_use(command, payload)
 
-        action = {"time": time.time(), "state_index": state_index, "process_id": process_id, "command": command}
-        engine.append_jsonl("actions.jsonl", action)
-        logging.info("command=%s", command)
-        print(command, flush=True)
+            narration_status = None
+            narration_text = None
+            if narration_client is not None and payload is not None and should_narrate_command(command):
+                text = str(payload.get("_sts_ai_narration_text") or "").strip() or build_narration_text(payload, command)
+                narration_text = text
+                narration_status = narration_client.say(
+                    text,
+                    metadata={
+                        "source": "slay-the-spire-ai",
+                        "state_index": state_index,
+                        "process_id": process_id,
+                        "command": command,
+                    },
+                )
+
+            action = {"time": time.time(), "state_index": state_index, "process_id": process_id, "command": command}
+            if narration_status:
+                action["narration_status"] = narration_status
+            if narration_text:
+                action["narration_text"] = narration_text
+            engine.append_jsonl("actions.jsonl", action)
+            logging.info("command=%s", command)
+            print(command, flush=True)
+    finally:
+        if narration_client is not None:
+            narration_client.close()
 
     logging.info("AI process stopped")
     return 0
@@ -107,6 +142,11 @@ def run_test(
         codex_model=codex_model,
         codex_command=codex_command or default_codex_command(),
         codex_timeout=codex_timeout,
+        narration_ui=False,
+        narration_url="ws://localhost:3010/ws/narration",
+        narration_speaker="nike",
+        narration_wait=True,
+        narration_timeout=12.0,
     )
     try:
         command = engine.choose_command(sample, options)
@@ -167,6 +207,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=float(os.environ.get("STS_AI_CODEX_TIMEOUT", "45")),
         help="Codex CLI timeout in seconds.",
     )
+    parser.add_argument(
+        "--narration-ui",
+        action="store_true",
+        default=os.environ.get("STS_AI_NARRATION_UI", "").lower() in {"1", "true", "yes", "on"},
+        help="Send gameplay commentary to the external narration relay.",
+    )
+    parser.add_argument(
+        "--narration-url",
+        default=os.environ.get("STS_AI_NARRATION_URL", "ws://localhost:3010/ws/narration"),
+        help="Narration relay WebSocket URL.",
+    )
+    parser.add_argument(
+        "--narration-speaker",
+        default=os.environ.get("STS_AI_NARRATION_SPEAKER", "nike"),
+        help="Speaker id sent to the narration UI.",
+    )
+    parser.add_argument(
+        "--narration-no-wait",
+        action="store_true",
+        help="Do not wait for narration:completed before sending the game command.",
+    )
+    parser.add_argument(
+        "--narration-timeout",
+        type=float,
+        default=float(os.environ.get("STS_AI_NARRATION_TIMEOUT", "12")),
+        help="Seconds to wait for narration completion before continuing gameplay.",
+    )
     return parser.parse_args(argv)
 
 
@@ -203,5 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         codex_model=args.codex_model,
         codex_command=args.codex_command,
         codex_timeout=args.codex_timeout,
+        narration_ui=args.narration_ui,
+        narration_url=args.narration_url,
+        narration_speaker=args.narration_speaker,
+        narration_wait=not args.narration_no_wait,
+        narration_timeout=args.narration_timeout,
     )
     return run_protocol(options)
