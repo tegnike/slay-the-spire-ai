@@ -14,6 +14,85 @@ from .models import Options
 from .narration import OFFICIAL_EMOTIONS, NarrationDirector, NarrationUIClient
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def narration_delivery_options(cue: object) -> tuple[bool, str, int | None]:
+    subtitle_only = bool(getattr(cue, "subtitle_only", False)) or os.environ.get("STS_AI_NARRATION_SUBTITLE_ONLY") == "1"
+    if _env_flag("STS_AI_NARRATION_FORCE_AUDIO"):
+        subtitle_only = False
+    queue_policy = str(getattr(cue, "queue_policy", "enqueue"))
+    max_queue_ms = getattr(cue, "max_queue_ms", 5000)
+    if not subtitle_only and _env_flag("STS_AI_NARRATION_FORCE_QUEUE"):
+        queue_policy = "enqueue"
+        max_queue_ms = max(int(max_queue_ms or 0), 15000)
+    if subtitle_only and os.environ.get("STS_AI_NARRATION_SUBTITLE_ONLY") == "1":
+        queue_policy = "enqueue"
+        max_queue_ms = max(int(max_queue_ms or 0), 6000)
+    return subtitle_only, queue_policy, max_queue_ms
+
+
+def send_narration_cue(
+    narration_client: NarrationUIClient,
+    cue: object,
+    *,
+    state_index: int,
+    process_id: int,
+    command: str,
+    sequence_index: int = 0,
+    sequence_total: int = 1,
+) -> dict[str, object]:
+    subtitle_only, queue_policy, max_queue_ms = narration_delivery_options(cue)
+    emotion = str(getattr(cue, "emotion", "neutral"))
+    thought = getattr(cue, "thought", None)
+    style = {
+        "pace": getattr(cue, "pace", "normal"),
+        "intensity": getattr(cue, "intensity", "normal"),
+        "priority": getattr(cue, "priority", 0),
+        "queue_policy": queue_policy,
+        "max_queue_ms": max_queue_ms,
+        "subtitle_only": subtitle_only,
+    }
+    started_at = time.time()
+    status = narration_client.say(
+        str(getattr(cue, "text", "")),
+        emotion=emotion,
+        pace=getattr(cue, "pace", "normal"),
+        intensity=getattr(cue, "intensity", "normal"),
+        priority=int(getattr(cue, "priority", 0)),
+        queue_policy=queue_policy,
+        max_queue_ms=max_queue_ms,
+        subtitle_only=subtitle_only,
+        interrupt=bool(getattr(cue, "interrupt", False)),
+        thought=thought,
+        metadata={
+            "source": "slay-the-spire-ai",
+            "state_index": state_index,
+            "process_id": process_id,
+            "command": command,
+            "narration_reason": getattr(cue, "reason", ""),
+            "narration_importance": getattr(cue, "importance", 0),
+            "sequence_index": sequence_index,
+            "sequence_total": sequence_total,
+        },
+    )
+    entry: dict[str, object] = {
+        "sequence_index": sequence_index,
+        "sequence_total": sequence_total,
+        "status": status,
+        "status_reason": narration_client.last_status_reason,
+        "text": str(getattr(cue, "text", "")),
+        "emotion": emotion,
+        "thought": thought,
+        "style": style,
+        "reason": getattr(cue, "reason", ""),
+        "importance": getattr(cue, "importance", 0),
+        "duration_ms": int((time.time() - started_at) * 1000),
+    }
+    return {key: value for key, value in entry.items() if value is not None}
+
+
 def run_protocol(options: Options) -> int:
     engine.setup_logging()
     process_id = os.getpid()
@@ -33,6 +112,7 @@ def run_protocol(options: Options) -> int:
 
     try:
         state_index = 0
+        previous_game_state: dict[str, object] | None = None
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -51,22 +131,27 @@ def run_protocol(options: Options) -> int:
                 payload["_sts_ai_received_at"] = time.time()
                 if narration_director is not None:
                     payload["_sts_ai_recent_narrations"] = narration_director.recent_texts()
+                    engine.annotate_transition_narration(payload, previous_game_state)
                 engine.append_jsonl("states.jsonl", payload)
                 command = engine.choose_command(payload, options)
                 engine.remember_potion_use(command, payload)
+                game_state = payload.get("game_state")
+                previous_game_state = game_state if isinstance(game_state, dict) else None
 
             narration_status = None
             narration_status_reason = None
             narration_text = None
             narration_emotion = None
+            narration_thought = None
             narration_style = None
+            narration_sequence = None
             if narration_client is not None and narration_director is not None and payload is not None:
-                cue = narration_director.choose(
+                cues = narration_director.choose_sequence(
                     payload,
                     command,
                     str(payload.get("_sts_ai_narration_text") or "").strip() or None,
                 )
-                if cue is None:
+                if not cues:
                     suppression_reason = narration_director.last_suppression_reason() or "producer_suppressed"
                     if suppression_reason == "non_speech_command":
                         narration_status = "suppressed"
@@ -84,36 +169,26 @@ def run_protocol(options: Options) -> int:
                         )
                         narration_status_reason = narration_client.last_status_reason
                 else:
-                    narration_text = cue.text
-                    narration_emotion = cue.emotion
-                    narration_style = {
-                        "pace": cue.pace,
-                        "intensity": cue.intensity,
-                        "priority": cue.priority,
-                        "queue_policy": cue.queue_policy,
-                        "max_queue_ms": cue.max_queue_ms,
-                        "subtitle_only": cue.subtitle_only,
-                    }
-                    narration_status = narration_client.say(
-                        cue.text,
-                        emotion=narration_emotion,
-                        pace=cue.pace,
-                        intensity=cue.intensity,
-                        priority=cue.priority,
-                        queue_policy=cue.queue_policy,
-                        max_queue_ms=cue.max_queue_ms,
-                        subtitle_only=cue.subtitle_only,
-                        interrupt=cue.interrupt,
-                        metadata={
-                            "source": "slay-the-spire-ai",
-                            "state_index": state_index,
-                            "process_id": process_id,
-                            "command": command,
-                            "narration_reason": cue.reason,
-                            "narration_importance": cue.importance,
-                        },
-                    )
-                    narration_status_reason = narration_client.last_status_reason
+                    narration_sequence = []
+                    for cue_index, cue in enumerate(cues):
+                        narration_sequence.append(
+                            send_narration_cue(
+                                narration_client,
+                                cue,
+                                state_index=state_index,
+                                process_id=process_id,
+                                command=command,
+                                sequence_index=cue_index,
+                                sequence_total=len(cues),
+                            )
+                        )
+                    final_entry = narration_sequence[-1]
+                    narration_status = str(final_entry.get("status") or "")
+                    narration_status_reason = final_entry.get("status_reason")
+                    narration_text = str(final_entry.get("text") or "")
+                    narration_emotion = str(final_entry.get("emotion") or "")
+                    narration_thought = final_entry.get("thought")
+                    narration_style = final_entry.get("style")
 
             action = {"time": time.time(), "state_index": state_index, "process_id": process_id, "command": command}
             if narration_status:
@@ -124,8 +199,12 @@ def run_protocol(options: Options) -> int:
                 action["narration_text"] = narration_text
             if narration_emotion:
                 action["narration_emotion"] = narration_emotion
+            if narration_thought:
+                action["narration_thought"] = narration_thought
             if narration_style:
                 action["narration_style"] = narration_style
+            if narration_sequence:
+                action["narration_sequence"] = narration_sequence
             engine.append_jsonl("actions.jsonl", action)
             logging.info("command=%s", command)
             print(command, flush=True)

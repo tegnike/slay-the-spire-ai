@@ -345,8 +345,101 @@ class CombatPolicyTests(unittest.TestCase):
 
         self.assertNotIn("narration", without_narration)
         self.assertIn("narration", with_narration)
+        self.assertIn("narration_thought", with_narration["narration"]["required_fields"])
         self.assertNotIn("narration_text", codex_without)
         self.assertIn("narration_text", codex_with)
+        self.assertIn("narration_thought", codex_with)
+
+    def test_openai_action_narration_records_thought_from_decision(self):
+        previous_key = os.environ.get("OPENAI_API_KEY")
+        previous_disabled = sts_ai_player.OPENAI_API_DISABLED_REASON
+        previous_last_error = sts_ai_player.OPENAI_API_LAST_ERROR
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        sts_ai_player.OPENAI_API_DISABLED_REASON = None
+        calls: list[dict] = []
+        original = sts_ai_player.run_openai_responses_api
+
+        def fake_run_openai_responses_api(payload, legal_action_ids, option_values, api_key):
+            calls.append(payload)
+            self.assertIn("play_1_0", legal_action_ids)
+            return {
+                "action_id": "play_1_0",
+                "rationale": "lethal attack",
+                "narration_mode": "say",
+                "narration_text": "ストライクで倒し切りましょう！",
+                "narration_emotion": "happy",
+                "narration_thought": "敵を倒せるので、ここは勝ち筋を優先します。",
+                "confidence": 0.91,
+            }
+
+        raw = {
+            "in_game": True,
+            "available_commands": ["play", "end", "state"],
+            "game_state": {
+                "screen_type": "NONE",
+                "combat_state": {
+                    "hand": [attack("Strike", "Strike_R")],
+                    "player": {"energy": 1},
+                    "monsters": [{"name": "Jaw Worm", "current_hp": 6, "block": 0}],
+                },
+            },
+        }
+
+        try:
+            sts_ai_player.run_openai_responses_api = fake_run_openai_responses_api
+            command = sts_ai_player.choose_openai_api_command(
+                raw,
+                options(use_openai_api=True, narration_ui=True),
+                "PLAY 1 0",
+            )
+        finally:
+            sts_ai_player.run_openai_responses_api = original
+            sts_ai_player.OPENAI_API_DISABLED_REASON = previous_disabled
+            sts_ai_player.OPENAI_API_LAST_ERROR = previous_last_error
+            if previous_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = previous_key
+
+        self.assertEqual(command, "PLAY 1 0")
+        self.assertEqual(raw["_sts_ai_narration_mode"], "say")
+        self.assertEqual(raw["_sts_ai_narration_text"], "ストライクで倒し切りましょう！")
+        self.assertEqual(raw["_sts_ai_narration_emotion"], "happy")
+        self.assertEqual(raw["_sts_ai_narration_thought"], "敵を倒せるので、ここは勝ち筋を優先します。")
+        self.assertIn("narration_thought", calls[0]["narration"]["required_fields"])
+
+    def test_openai_failure_falls_back_to_local_policy(self):
+        previous_key = os.environ.get("OPENAI_API_KEY")
+        previous_disabled = sts_ai_player.OPENAI_API_DISABLED_REASON
+        previous_last_error = sts_ai_player.OPENAI_API_LAST_ERROR
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ.pop("STS_AI_OPENAI_API_KEY", None)
+        sts_ai_player.OPENAI_API_DISABLED_REASON = None
+        sts_ai_player.OPENAI_API_LAST_ERROR = None
+        raw = {
+            "in_game": True,
+            "available_commands": ["play", "end", "state"],
+            "game_state": {
+                "screen_type": "NONE",
+                "combat_state": {
+                    "hand": [attack("Strike", "Strike_R")],
+                    "player": {"energy": 1},
+                    "monsters": [{"name": "Jaw Worm", "current_hp": 6, "block": 0}],
+                },
+            },
+        }
+
+        try:
+            command = sts_ai_player.choose_command(raw, options(use_openai_api=True, narration_ui=True))
+        finally:
+            sts_ai_player.OPENAI_API_DISABLED_REASON = previous_disabled
+            sts_ai_player.OPENAI_API_LAST_ERROR = previous_last_error
+            if previous_key is not None:
+                os.environ["OPENAI_API_KEY"] = previous_key
+
+        self.assertEqual(command, "PLAY 1 0")
+        self.assertIn("_sts_ai_openai_fallback_reason", raw)
+        self.assertIn("OPENAI_API_KEY is not set", raw["_sts_ai_openai_fallback_reason"])
 
     def test_shop_room_with_insufficient_gold_only_exposes_proceed(self):
         sts_ai_player.SHOP_VISITED_KEYS.clear()
@@ -413,6 +506,7 @@ class CombatPolicyTests(unittest.TestCase):
                 "narration_mode": "say",
                 "narration_text": "ここで倒れましたが、最後まで攻め切りました。",
                 "narration_emotion": "sad",
+                "narration_thought": "ゲームオーバー画面なので、停止前にランの終わりを記録します。",
                 "confidence": 0.9,
             }
 
@@ -460,9 +554,113 @@ class CombatPolicyTests(unittest.TestCase):
         self.assertEqual(raw["_sts_ai_narration_mode"], "say")
         self.assertEqual(raw["_sts_ai_narration_text"], "ここで倒れましたが、最後まで攻め切りました。")
         self.assertEqual(raw["_sts_ai_narration_emotion"], "sad")
+        self.assertEqual(raw["_sts_ai_narration_thought"], "ゲームオーバー画面なので、停止前にランの終わりを記録します。")
         self.assertEqual(calls[0]["event"]["type"], "game_over")
+        self.assertIn("narration_thought", calls[0]["narration"]["required_fields"])
         self.assertEqual(calls[0]["narration"]["recent_examples"], ["次のターンへつなげます。"])
         self.assertEqual(repeated_command, "WAIT 300")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(repeated_raw["_sts_ai_narration_mode"], "silent")
+
+    def test_combat_reward_transition_marks_victory_event(self):
+        previous_state = {
+            "seed": 123,
+            "act": 1,
+            "floor": 5,
+            "screen_type": "NONE",
+            "current_hp": 20,
+            "max_hp": 80,
+            "room_type": "MonsterRoom",
+            "combat_state": {
+                "turn": 2,
+                "player": {"current_hp": 20},
+                "monsters": [
+                    {"name": "Fungi Beast", "current_hp": 2, "max_hp": 26, "is_gone": False},
+                    {"name": "Fungi Beast", "current_hp": 0, "max_hp": 24, "is_gone": True},
+                ],
+            },
+        }
+        raw = {
+            "game_state": {
+                "seed": 123,
+                "act": 1,
+                "floor": 5,
+                "screen_type": "COMBAT_REWARD",
+                "current_hp": 26,
+                "max_hp": 80,
+                "screen_state": {"rewards": [{"reward_type": "GOLD", "gold": 17}, {"reward_type": "CARD"}]},
+            }
+        }
+
+        sts_ai_player.annotate_transition_narration(raw, previous_state)
+
+        self.assertEqual(raw["_sts_ai_narration_event"], "combat_victory")
+        self.assertEqual(raw["_sts_ai_action_description"], "React to the combat victory before collecting rewards.")
+        context = raw["_sts_ai_victory_context"]
+        self.assertEqual(context["floor"], 5)
+        self.assertEqual(context["hp_before_reward"], 20)
+        self.assertEqual(context["hp_after_reward"], 26)
+        self.assertEqual([enemy["name"] for enemy in context["enemies"]], ["Fungi Beast", "Fungi Beast"])
+        self.assertEqual([reward["reward_type"] for reward in context["rewards"]], ["GOLD", "CARD"])
+
+    def test_combat_victory_event_requests_one_shot_openai_narration(self):
+        sts_ai_player.EVENT_NARRATION_KEYS.clear()
+        previous_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        calls: list[dict] = []
+        original = sts_ai_player.run_openai_narration_api
+
+        def fake_run_openai_narration_api(payload, option_values, api_key):
+            calls.append(payload)
+            return {
+                "rationale": "victory reaction",
+                "narration_mode": "say",
+                "narration_text": "やりました！きっちり勝ち切りました。",
+                "narration_emotion": "happy",
+                "narration_thought": "戦闘勝利に入ったため、報酬処理の前に区切りを作ります。",
+                "confidence": 0.92,
+            }
+
+        raw = {
+            "_sts_ai_log_index": 84,
+            "_sts_ai_narration_event": "combat_victory",
+            "_sts_ai_recent_narrations": ["次のターンへつなげます。"],
+            "_sts_ai_victory_context": {
+                "floor": 5,
+                "hp_after_reward": 26,
+                "max_hp": 80,
+                "enemies": [{"name": "Fungi Beast"}],
+            },
+            "game_state": {
+                "seed": 123,
+                "act": 1,
+                "floor": 5,
+                "screen_type": "COMBAT_REWARD",
+                "current_hp": 26,
+                "max_hp": 80,
+            },
+        }
+
+        try:
+            sts_ai_player.run_openai_narration_api = fake_run_openai_narration_api
+            sts_ai_player.prepare_event_narration(raw, options(use_openai_api=True, narration_ui=True))
+            repeated_raw = {**raw, "_sts_ai_narration_text": "", "_sts_ai_narration_mode": ""}
+            sts_ai_player.prepare_event_narration(repeated_raw, options(use_openai_api=True, narration_ui=True))
+        finally:
+            sts_ai_player.run_openai_narration_api = original
+            if previous_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = previous_key
+
+        self.assertEqual(raw["_sts_ai_narration_mode"], "say")
+        self.assertEqual(raw["_sts_ai_narration_text"], "やりました！きっちり勝ち切りました。")
+        self.assertEqual(raw["_sts_ai_narration_emotion"], "happy")
+        self.assertEqual(raw["_sts_ai_narration_thought"], "戦闘勝利に入ったため、報酬処理の前に区切りを作ります。")
+        self.assertEqual(calls[0]["event"]["type"], "combat_victory")
+        self.assertIn("narration_thought", calls[0]["narration"]["required_fields"])
+        self.assertIn("not a description of collecting rewards", " ".join(calls[0]["narration"]["style"]))
+        self.assertEqual(calls[0]["narration"]["recent_examples"], ["次のターンへつなげます。"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(repeated_raw["_sts_ai_narration_mode"], "silent")
 

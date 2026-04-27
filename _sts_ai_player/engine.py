@@ -48,6 +48,7 @@ OFFICIAL_NARRATION_EMOTIONS = {"neutral", "happy", "angry", "sad", "thinking"}
 
 SHOP_VISITED_KEYS: set[tuple[str, int, int]] = set()
 PAUSE_NARRATION_KEYS: set[tuple[str, str, int, int]] = set()
+EVENT_NARRATION_KEYS: set[tuple[str, str, int, int]] = set()
 
 
 def setup_logging() -> None:
@@ -108,6 +109,7 @@ def choose_command(raw: dict[str, Any], options: Options) -> str:
     if pause_reason_value:
         prepare_pause_narration(raw, options, pause_reason_value)
         return pause_command(raw)
+    prepare_event_narration(raw, options)
 
     rule_command = choose_rule_command(raw, options)
     if should_skip_codex(raw):
@@ -119,8 +121,9 @@ def choose_command(raw: dict[str, Any], options: Options) -> str:
         except Exception as error:
             global OPENAI_API_LAST_ERROR
             OPENAI_API_LAST_ERROR = f"{error.__class__.__name__}: {error}"
-            logging.exception("OpenAI API decision failed; stopping instead of falling back")
-            raise
+            raw["_sts_ai_openai_fallback_reason"] = OPENAI_API_LAST_ERROR
+            logging.exception("OpenAI API decision failed; falling back to local policy")
+            return rule_command
 
     if options.use_codex:
         try:
@@ -175,14 +178,14 @@ def prepare_pause_narration(raw: dict[str, Any], options: Options, reason: str) 
 
     PAUSE_NARRATION_KEYS.add(key)
     if not options.use_openai_api:
-        raw["_sts_ai_narration_mode"] = "silent"
-        raw["_sts_ai_narration_emotion"] = "neutral"
+        raw["_sts_ai_narration_mode"] = "say"
+        raw["_sts_ai_narration_emotion"] = pause_narration_emotion(reason)
         return
 
     api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("STS_AI_OPENAI_API_KEY")
     if not api_key or OPENAI_API_DISABLED_REASON:
-        raw["_sts_ai_narration_mode"] = "silent"
-        raw["_sts_ai_narration_emotion"] = "neutral"
+        raw["_sts_ai_narration_mode"] = "say"
+        raw["_sts_ai_narration_emotion"] = pause_narration_emotion(reason)
         return
 
     pause_payload = build_pause_narration_payload(
@@ -210,16 +213,21 @@ def prepare_pause_narration(raw: dict[str, Any], options: Options, reason: str) 
             api_key,
         )
     except Exception:
-        logging.exception("OpenAI pause narration failed; continuing silently")
-        raw["_sts_ai_narration_mode"] = "silent"
-        raw["_sts_ai_narration_emotion"] = "neutral"
+        logging.exception("OpenAI pause narration failed; using local pause narration")
+        raw["_sts_ai_narration_mode"] = "say"
+        raw["_sts_ai_narration_emotion"] = pause_narration_emotion(reason)
         return
 
     narration_text = normalize_narration_text(decision.get("narration_text"))
     narration_mode = normalize_narration_mode(decision.get("narration_mode")) or ("say" if narration_text else "silent")
+    if reason in {"game_over", "max_floor"} and narration_mode == "silent":
+        narration_mode = "say"
     narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) or pause_narration_emotion(reason)
+    narration_thought = normalize_narration_thought(decision.get("narration_thought"))
     if narration_text:
         raw["_sts_ai_narration_text"] = narration_text
+    if narration_thought:
+        raw["_sts_ai_narration_thought"] = narration_thought
     raw["_sts_ai_narration_mode"] = narration_mode
     raw["_sts_ai_narration_emotion"] = narration_emotion
     append_jsonl(
@@ -236,6 +244,7 @@ def prepare_pause_narration(raw: dict[str, Any], options: Options, reason: str) 
             "narration_mode": narration_mode,
             "narration_text": narration_text,
             "narration_emotion": narration_emotion,
+            "narration_thought": narration_thought,
             "confidence": decision.get("confidence"),
             "fallback": pause_command(raw),
             "override_reason": None,
@@ -263,6 +272,147 @@ def pause_narration_description(reason: str) -> str:
 
 def pause_narration_emotion(reason: str) -> str:
     return "sad" if reason == "game_over" else "thinking"
+
+
+def annotate_transition_narration(raw: dict[str, Any], previous_state: dict[str, Any] | None) -> None:
+    if not previous_state:
+        return
+    if raw.get("_sts_ai_narration_event"):
+        return
+    state = raw.get("game_state") or {}
+    if not isinstance(state, dict):
+        return
+    screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
+    previous_screen = str(previous_state.get("screen_type") or previous_state.get("screen_name") or "").upper()
+    previous_combat = previous_state.get("combat_state") or {}
+    if screen_type != "COMBAT_REWARD" or previous_screen not in {"", "NONE"} or not isinstance(previous_combat, dict):
+        return
+    monsters = [monster for monster in previous_combat.get("monsters") or [] if isinstance(monster, dict)]
+    if not monsters:
+        return
+    raw["_sts_ai_narration_event"] = "combat_victory"
+    raw["_sts_ai_action_description"] = "React to the combat victory before collecting rewards."
+    raw["_sts_ai_victory_context"] = build_combat_victory_context(previous_state, state, monsters)
+
+
+def build_combat_victory_context(
+    previous_state: dict[str, Any],
+    state: dict[str, Any],
+    monsters: list[dict[str, Any]],
+) -> dict[str, Any]:
+    previous_combat = previous_state.get("combat_state") or {}
+    previous_player = previous_combat.get("player") or {}
+    screen_state = state.get("screen_state") or {}
+    rewards = []
+    for reward in screen_state.get("rewards") or []:
+        if not isinstance(reward, dict):
+            continue
+        item = {"reward_type": reward.get("reward_type"), "gold": reward.get("gold")}
+        if isinstance(reward.get("potion"), dict):
+            item["potion"] = reward["potion"].get("name") or reward["potion"].get("id")
+        if isinstance(reward.get("relic"), dict):
+            item["relic"] = reward["relic"].get("name") or reward["relic"].get("id")
+        rewards.append(item)
+    return {
+        "floor": state.get("floor"),
+        "act": state.get("act"),
+        "room_type": state.get("room_type") or previous_state.get("room_type"),
+        "hp_before_reward": previous_state.get("current_hp") or previous_player.get("current_hp"),
+        "hp_after_reward": state.get("current_hp"),
+        "max_hp": state.get("max_hp"),
+        "turn": previous_combat.get("turn"),
+        "enemies": [
+            {
+                "name": monster.get("name") or monster.get("id"),
+                "hp_before_transition": monster.get("current_hp"),
+                "max_hp": monster.get("max_hp"),
+                "is_gone": monster.get("is_gone"),
+            }
+            for monster in monsters
+        ],
+        "rewards": rewards,
+    }
+
+
+def prepare_event_narration(raw: dict[str, Any], options: Options) -> None:
+    event = str(raw.get("_sts_ai_narration_event") or "").strip().lower()
+    if event != "combat_victory" or not options.narration_ui:
+        return
+    key = event_narration_key(raw, event)
+    if key in EVENT_NARRATION_KEYS:
+        raw["_sts_ai_narration_mode"] = "silent"
+        raw["_sts_ai_narration_emotion"] = "neutral"
+        return
+    EVENT_NARRATION_KEYS.add(key)
+    if not options.use_openai_api:
+        return
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("STS_AI_OPENAI_API_KEY")
+    if not api_key or OPENAI_API_DISABLED_REASON:
+        return
+
+    event_payload = build_event_narration_payload(
+        raw,
+        event,
+        recent_narrations=normalize_recent_narrations(raw.get("_sts_ai_recent_narrations")),
+    )
+    append_jsonl(
+        "openai_requests.jsonl",
+        {
+            "time": time.time(),
+            "state_index": raw.get("_sts_ai_log_index"),
+            "process_id": raw.get("_sts_ai_process_id"),
+            "model": options.openai_model,
+            "request_type": "event_narration",
+            "narration_event": event,
+            "payload": event_payload,
+        },
+    )
+    try:
+        decision = run_openai_narration_api(event_payload, options, api_key)
+    except Exception:
+        logging.exception("OpenAI event narration failed; falling back to local narration candidates")
+        return
+
+    narration_text = normalize_narration_text(decision.get("narration_text"))
+    narration_mode = normalize_narration_mode(decision.get("narration_mode")) or ("say" if narration_text else "silent")
+    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) or "happy"
+    narration_thought = normalize_narration_thought(decision.get("narration_thought"))
+    if narration_text:
+        raw["_sts_ai_narration_text"] = narration_text
+    if narration_thought:
+        raw["_sts_ai_narration_thought"] = narration_thought
+    raw["_sts_ai_narration_mode"] = narration_mode
+    raw["_sts_ai_narration_emotion"] = narration_emotion
+    append_jsonl(
+        "openai_decisions.jsonl",
+        {
+            "time": time.time(),
+            "state_index": raw.get("_sts_ai_log_index"),
+            "process_id": raw.get("_sts_ai_process_id"),
+            "model": options.openai_model,
+            "action_id": f"event_{event}_narration",
+            "command": None,
+            "model_command": None,
+            "rationale": decision.get("rationale", ""),
+            "narration_mode": narration_mode,
+            "narration_text": narration_text,
+            "narration_emotion": narration_emotion,
+            "narration_thought": narration_thought,
+            "confidence": decision.get("confidence"),
+            "fallback": None,
+            "override_reason": None,
+        },
+    )
+
+
+def event_narration_key(raw: dict[str, Any], event: str) -> tuple[str, str, int, int]:
+    state = raw.get("game_state") or {}
+    return (
+        event,
+        str(state.get("seed") or ""),
+        int(state.get("act") or 0),
+        int(state.get("floor") or 0),
+    )
 
 
 def pause_command(raw: dict[str, Any]) -> str:
@@ -629,7 +779,7 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
         state,
         action_payload,
         fallback_command,
-        include_narration=options.narration_ui,
+        include_narration=options.narration_ui and not raw.get("_sts_ai_narration_event"),
         recent_narrations=normalize_recent_narrations(raw.get("_sts_ai_recent_narrations")),
     )
     decision = run_codex_cli(prompt, options)
@@ -641,11 +791,15 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
         return fallback_command
 
     raw["_sts_ai_action_description"] = action.description
-    narration_text = normalize_narration_text(decision.get("narration_text")) if options.narration_ui else None
-    narration_mode = normalize_narration_mode(decision.get("narration_mode")) if options.narration_ui else None
-    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) if options.narration_ui else None
+    action_narration_enabled = options.narration_ui and not raw.get("_sts_ai_narration_event")
+    narration_text = normalize_narration_text(decision.get("narration_text")) if action_narration_enabled else None
+    narration_mode = normalize_narration_mode(decision.get("narration_mode")) if action_narration_enabled else None
+    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) if action_narration_enabled else None
+    narration_thought = normalize_narration_thought(decision.get("narration_thought")) if action_narration_enabled else None
     if narration_text:
         raw["_sts_ai_narration_text"] = narration_text
+    if narration_thought:
+        raw["_sts_ai_narration_thought"] = narration_thought
     if narration_mode:
         raw["_sts_ai_narration_mode"] = narration_mode
     if narration_emotion:
@@ -663,6 +817,7 @@ def choose_codex_command(raw: dict[str, Any], options: Options, fallback_command
             "narration_mode": narration_mode,
             "narration_text": narration_text,
             "narration_emotion": narration_emotion,
+            "narration_thought": narration_thought,
             "fallback": fallback_command,
         },
     )
@@ -691,7 +846,7 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
     decision_payload = build_decision_payload(
         state,
         legal_actions,
-        include_narration=options.narration_ui,
+        include_narration=options.narration_ui and not raw.get("_sts_ai_narration_event"),
         recent_narrations=normalize_recent_narrations(raw.get("_sts_ai_recent_narrations")),
     )
     append_jsonl(
@@ -737,11 +892,15 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
         final_command = fallback_command
 
     raw["_sts_ai_action_description"] = action_description_for_command(legal_actions, final_command) or action.description
-    narration_text = normalize_narration_text(decision.get("narration_text")) if options.narration_ui else None
-    narration_mode = normalize_narration_mode(decision.get("narration_mode")) if options.narration_ui else None
-    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) if options.narration_ui else None
+    action_narration_enabled = options.narration_ui and not raw.get("_sts_ai_narration_event")
+    narration_text = normalize_narration_text(decision.get("narration_text")) if action_narration_enabled else None
+    narration_mode = normalize_narration_mode(decision.get("narration_mode")) if action_narration_enabled else None
+    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) if action_narration_enabled else None
+    narration_thought = normalize_narration_thought(decision.get("narration_thought")) if action_narration_enabled else None
     if narration_text:
         raw["_sts_ai_narration_text"] = narration_text
+    if narration_thought:
+        raw["_sts_ai_narration_thought"] = narration_thought
     if narration_mode:
         raw["_sts_ai_narration_mode"] = narration_mode
     if narration_emotion:
@@ -760,6 +919,7 @@ def choose_openai_api_command(raw: dict[str, Any], options: Options, fallback_co
             "narration_mode": narration_mode,
             "narration_text": narration_text,
             "narration_emotion": narration_emotion,
+            "narration_thought": narration_thought,
             "confidence": decision.get("confidence"),
             "fallback": fallback_command,
             "override_reason": override_reason,
@@ -888,6 +1048,9 @@ def build_decision_payload(
             ],
         },
         "state": summarize_state(state),
+        "run_theme": build_run_theme(state),
+        "deck_plan": build_deck_plan(state),
+        "choice_context": build_choice_context(state),
         "legal_actions": [
             {"action_id": action.action_id, "command": action.command, "description": action.description}
             for action in legal_actions
@@ -895,25 +1058,58 @@ def build_decision_payload(
     }
     if include_narration:
         payload["narration"] = {
-            "required_fields": ["narration_mode", "narration_text", "narration_emotion"],
+            "required_fields": ["narration_mode", "narration_text", "narration_emotion", "narration_thought"],
             "style": [
                 "Choose narration_mode=say for moments worth hearing, or silent for low-value repeated transitions.",
                 "When saying something, write one short Japanese spoken line for a game commentator.",
-                "Vary the angle like a real commentator: live reaction, tactical explanation, next-turn forecast, or flow recap.",
+                "Vary the angle like a real commentator: visible decision summary, live reaction, tactical explanation, next-turn forecast, deck-plan note, viewer consultation, or flow recap.",
                 "Do not merely restate the action. Prefer why it matters, what it sets up, or what risk remains.",
+                "Occasionally include a brief viewer-facing consultation such as whether to attack, block, skip, or build toward the deck plan; keep it answerable in one breath.",
+                "For beginner-friendly moments, explain one simple concept briefly, such as why removing an enemy reduces future damage or why skipping a weak card can help the deck.",
+                "Use deck_plan, run_theme, and choice_context as public context. Do not expose private reasoning or step-by-step deliberation.",
                 "Write Japanese only. Do not include English words or roman letters.",
                 "If a card, relic, monster, or game term is English, rewrite it in Japanese katakana or a Japanese translation.",
+                "When using a monster or boss name, generate the spoken Japanese name inside narration_text; never leave raw English, empty parentheses, or unnamed fragments.",
+                "When mentioning enemy health, say 残り体力12 or 体力12. Do not say 残り12 without the health unit.",
                 "Use polite speech matching the narrator character. Avoid rough imperatives or casual endings.",
                 "Do not include the rationale, chain-of-thought, action_id, command syntax, or English strategic analysis.",
-                "Mention concrete game facts when useful: remaining HP, incoming damage, block, next turn, or route pressure.",
+                "Also write narration_thought as one short public Japanese decision note for the UI event log, not hidden reasoning and not a step-by-step chain.",
+                "Mention concrete game facts when useful: remaining enemy health, incoming damage, block, next turn, or route pressure.",
                 "Avoid repeating recent_examples, especially the same opener or the same tactical meaning.",
                 "Use narration_emotion as one of neutral, happy, angry, sad, thinking.",
                 "Aim for 12 to 35 Japanese characters. Maximum 60 characters.",
             ],
             "examples": [
-                {"narration_mode": "say", "narration_text": "ここで落とせると次がかなり楽です。", "narration_emotion": "happy"},
-                {"narration_mode": "say", "narration_text": "被弾は残りますが、先に倒す判断です。", "narration_emotion": "thinking"},
-                {"narration_mode": "silent", "narration_text": "", "narration_emotion": "neutral"},
+                {
+                    "narration_mode": "say",
+                    "narration_text": "ここで落とせると次がかなり楽です。",
+                    "narration_emotion": "happy",
+                    "narration_thought": "敵を減らすことで次ターンの被弾を抑える判断です。",
+                },
+                {
+                    "narration_mode": "say",
+                    "narration_text": "ここは攻め切りでいいでしょうか？",
+                    "narration_emotion": "thinking",
+                    "narration_thought": "攻撃寄りのデッキ方針に合わせて押す場面です。",
+                },
+                {
+                    "narration_mode": "say",
+                    "narration_text": "弱い一枚は取らないのも強化です。",
+                    "narration_emotion": "neutral",
+                    "narration_thought": "デッキを薄く保つ方が強いカードを引きやすいです。",
+                },
+                {
+                    "narration_mode": "say",
+                    "narration_text": "被弾は残りますが、先に倒す判断です。",
+                    "narration_emotion": "thinking",
+                    "narration_thought": "防御よりも討伐を進める方が総被害を下げやすい場面です。",
+                },
+                {
+                    "narration_mode": "silent",
+                    "narration_text": "",
+                    "narration_emotion": "neutral",
+                    "narration_thought": "直近と似た低価値な進行なので発話を抑えます。",
+                },
             ],
         }
         recent_examples = recent_narration_examples or recent_narrations or []
@@ -942,27 +1138,337 @@ def build_pause_narration_payload(
             "command_after_narration": pause_command(raw),
         },
         "state": summarize_state(state),
+        "run_theme": build_run_theme(state),
+        "deck_plan": build_deck_plan(state),
+        "choice_context": build_choice_context(state),
         "narration": {
-            "required_fields": ["narration_mode", "narration_text", "narration_emotion"],
+            "required_fields": ["narration_mode", "narration_text", "narration_emotion", "narration_thought"],
             "style": [
                 "Choose narration_mode=say unless recent_examples already covered this same moment.",
                 "Write one short Japanese spoken line for a polite live narrator.",
                 "Do not use a fixed template. React to the actual run state: floor, HP, boss or monster, deck, and final risk.",
-                "For game_over, close the run with a natural, varied line that fits how it ended.",
+                "For game_over, close the run with a natural, varied failure reaction that fits how it ended, without blaming the player.",
+                "For a close loss, mention what almost worked or what the deck was trying to do.",
                 "For max_floor, explain that this is the configured pause point without sounding like a system message.",
+                "A short viewer-facing reflection or consultation is allowed if it sounds like live commentary.",
+                "Use deck_plan, run_theme, and choice_context as public context. Do not expose private reasoning or step-by-step deliberation.",
                 "Write Japanese only. Do not include English words or roman letters.",
                 "If a card, relic, monster, or game term is English, rewrite it in Japanese katakana or a Japanese translation.",
+                "When using a monster or boss name, generate the spoken Japanese name inside narration_text; never leave raw English, empty parentheses, or unnamed fragments.",
+                "When mentioning enemy health, say 残り体力12 or 体力12. Do not say 残り12 without the health unit.",
                 "Use polite speech matching the narrator character.",
                 "Do not include the rationale, command syntax, or English strategic analysis.",
+                "Also write narration_thought as one short public Japanese note explaining what changed at this pause point.",
                 "Avoid repeating recent_examples, especially the same opener or ending.",
                 "Use narration_emotion as one of neutral, happy, angry, sad, thinking.",
                 "Aim for 16 to 45 Japanese characters. Maximum 70 characters.",
+            ],
+            "examples": [
+                {
+                    "narration_mode": "say",
+                    "narration_text": "惜しいです、攻め筋は見えていました。",
+                    "narration_emotion": "sad",
+                    "narration_thought": "勝ち筋はあったものの体力が先に尽きました。",
+                },
+                {
+                    "narration_mode": "say",
+                    "narration_text": "ここで一区切り、方針は悪くありません。",
+                    "narration_emotion": "neutral",
+                    "narration_thought": "停止地点に到達したため進行を止めます。",
+                },
             ],
         },
     }
     if recent_narrations:
         payload["narration"]["recent_examples"] = recent_narrations[-8:]
     return payload
+
+
+def build_event_narration_payload(
+    raw: dict[str, Any],
+    event: str,
+    *,
+    recent_narrations: list[str] | None = None,
+) -> dict[str, Any]:
+    state = raw.get("game_state") or {}
+    if not isinstance(state, dict):
+        state = {}
+    victory_context = raw.get("_sts_ai_victory_context") if event == "combat_victory" else None
+    payload: dict[str, Any] = {
+        "event": {
+            "type": event,
+            "description": "Combat has just ended and the game has moved to the reward screen.",
+        },
+        "state": summarize_state(state),
+        "run_theme": build_run_theme(state),
+        "deck_plan": build_deck_plan(state),
+        "choice_context": build_choice_context(state),
+        "victory_context": victory_context if isinstance(victory_context, dict) else {},
+        "narration": {
+            "required_fields": ["narration_mode", "narration_text", "narration_emotion", "narration_thought"],
+            "style": [
+                "Choose narration_mode=say unless this victory is already covered by recent_examples.",
+                "Write one short Japanese spoken line for a polite live narrator.",
+                "This is a reaction to winning the fight, not a description of collecting rewards.",
+                "It may include a bright victory reaction like やりました！ when natural.",
+                "React to concrete facts when useful: enemy name, floor, remaining player HP, enemy health, or survival pressure.",
+                "Mention how the win supports the deck plan or run theme when it is useful and brief.",
+                "For beginner-friendly moments, explain one simple idea like why ending a fight before more attacks protects HP.",
+                "A short viewer-facing celebration or consultation is allowed if it sounds like live commentary.",
+                "Use deck_plan, run_theme, and choice_context as public context. Do not expose private reasoning or step-by-step deliberation.",
+                "Do not use a fixed template. Vary the opener and the tactical meaning.",
+                "Write Japanese only. Do not include English words or roman letters.",
+                "If a card, relic, monster, or game term is English, rewrite it in Japanese katakana or a Japanese translation.",
+                "When using a monster or boss name, generate the spoken Japanese name inside narration_text; never leave raw English, empty parentheses, or unnamed fragments.",
+                "When mentioning enemy health, say 残り体力12 or 体力12. Do not say 残り12 without the health unit.",
+                "Use polite speech matching the narrator character.",
+                "Also write narration_thought as one short public Japanese note for the UI event log.",
+                "Avoid repeating recent_examples, especially the same opener or ending.",
+                "Use narration_emotion as one of neutral, happy, angry, sad, thinking.",
+                "Aim for 12 to 35 Japanese characters. Maximum 60 characters.",
+            ],
+            "examples": [
+                {
+                    "narration_mode": "say",
+                    "narration_text": "やりました、体力を守って突破です。",
+                    "narration_emotion": "happy",
+                    "narration_thought": "早めに倒して次の戦闘へ体力を残せました。",
+                },
+                {
+                    "narration_mode": "say",
+                    "narration_text": "皆さん、この報酬は方針に合うでしょうか？",
+                    "narration_emotion": "thinking",
+                    "narration_thought": "勝利後はデッキ方針に合う報酬を見たい場面です。",
+                },
+            ],
+        },
+    }
+    if recent_narrations:
+        payload["narration"]["recent_examples"] = recent_narrations[-8:]
+    return payload
+
+
+def build_run_theme(state: dict[str, Any]) -> dict[str, Any]:
+    floor = public_int(state.get("floor"))
+    act = public_int(state.get("act"))
+    current_hp = state.get("current_hp")
+    max_hp = state.get("max_hp")
+    room_type = str(state.get("room_type") or "")
+    boss = state.get("act_boss")
+    class_name = narrator_class_name(state.get("class"))
+    themes = infer_deck_themes(state)
+    pressure: list[str] = []
+    try:
+        if current_hp is not None and max_hp:
+            hp_ratio = int(current_hp) / max(1, int(max_hp))
+            if hp_ratio <= 0.3:
+                pressure.append("体力が低く、被弾を抑える価値が高い")
+            elif hp_ratio >= 0.75:
+                pressure.append("体力に余裕があり、攻めや成長に回しやすい")
+    except (TypeError, ValueError):
+        pass
+    if room_type:
+        pressure.append(f"現在の部屋は{room_type}")
+    if boss:
+        pressure.append(f"この幕のボスは{boss}")
+    summary_parts = []
+    if class_name:
+        summary_parts.append(class_name)
+    if act:
+        summary_parts.append(f"第{act}幕")
+    if floor:
+        summary_parts.append(f"{floor}階")
+    return {
+        "summary": "・".join(summary_parts) or "現在のラン状況",
+        "deck_identity": themes[:4],
+        "pressure": pressure[:4],
+    }
+
+
+def build_deck_plan(state: dict[str, Any]) -> dict[str, Any]:
+    deck = [card for card in state.get("deck") or [] if isinstance(card, dict)]
+    if not deck:
+        return {}
+    themes = infer_deck_themes(state)
+    type_counts = count_card_types(deck)
+    key_cards = interesting_deck_cards(deck)
+    act = public_int(state.get("act"))
+    priorities: list[str] = []
+    watchouts: list[str] = []
+    if act <= 1:
+        priorities.append("序盤は高打点で戦闘を短く終わらせたい")
+    if any("弱体" in theme for theme in themes):
+        priorities.append("弱体を入れて大きい打点につなげたい")
+    if any("筋力" in theme for theme in themes):
+        priorities.append("筋力を伸ばして多段攻撃や重い攻撃を強く使いたい")
+    if any("廃棄" in theme for theme in themes):
+        priorities.append("廃棄で手札と防御の質を上げたい")
+    if any("ブロック" in theme for theme in themes):
+        priorities.append("ブロックを厚くして反撃や長期戦に持ち込みたい")
+    if not priorities:
+        priorities.append("強い攻撃と防御を増やし、不要な一枚を増やしすぎない")
+    if type_counts.get("ATTACK", 0) <= 4:
+        watchouts.append("攻撃が少ないため敵を倒す速度に注意")
+    if type_counts.get("SKILL", 0) <= 4:
+        watchouts.append("防御札が少ないため大きい攻撃ターンに注意")
+    if len(deck) >= 28:
+        watchouts.append("山札が厚く、狙いのカードを引くまでが遅い")
+    return {
+        "size": len(deck),
+        "themes": themes[:5],
+        "priorities": priorities[:4],
+        "watchouts": watchouts[:3],
+        "key_cards": key_cards[:8],
+    }
+
+
+def build_choice_context(state: dict[str, Any]) -> dict[str, Any]:
+    combat = state.get("combat_state") or {}
+    if isinstance(combat, dict) and combat:
+        player = combat.get("player") or {}
+        monsters = [monster for monster in combat.get("monsters") or [] if isinstance(monster, dict)]
+        live_monsters = [
+            monster
+            for monster in monsters
+            if not monster.get("is_gone") and not monster.get("half_dead") and public_int(monster.get("current_hp")) > 0
+        ]
+        incoming = estimate_incoming_damage(monsters)
+        block = public_int(player.get("block"))
+        context: dict[str, Any] = {
+            "moment": "combat",
+            "turn": combat.get("turn"),
+            "incoming_damage": incoming,
+            "current_block": block,
+            "damage_after_block": max(0, incoming - block),
+            "live_enemies": [
+                {
+                    "name": monster.get("name") or monster.get("id"),
+                    "hp": monster.get("current_hp"),
+                    "block": monster.get("block") or 0,
+                    "intent": monster.get("intent"),
+                    "incoming_damage": monster_incoming_damage(monster),
+                }
+                for monster in live_monsters[:4]
+            ],
+            "viewer_hook": "攻めるか守るかを短く相談しやすい場面",
+        }
+        if incoming > block:
+            context["beginner_note"] = "ブロックを超えた分だけ体力が減る"
+        elif live_monsters:
+            context["beginner_note"] = "敵を早く倒すほど次ターン以降の被弾が減る"
+        return context
+
+    screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
+    screen_state = state.get("screen_state") or {}
+    choices = screen_choices(state, screen_state) if isinstance(screen_state, dict) else []
+    context = {
+        "moment": screen_type or "screen",
+        "choices": choices[:8],
+        "viewer_hook": screen_viewer_hook(screen_type),
+        "beginner_note": screen_beginner_note(screen_type, screen_state if isinstance(screen_state, dict) else {}),
+    }
+    return {key: value for key, value in context.items() if value}
+
+
+def infer_deck_themes(state: dict[str, Any]) -> list[str]:
+    deck = [card for card in state.get("deck") or [] if isinstance(card, dict)]
+    if not deck:
+        return []
+    names = {normalize_card_name(card) for card in deck}
+    normalized = {normalize_name(name) for name in names}
+    themes: list[str] = []
+    if normalized & {"inflame", "spot weakness", "demon form", "limit break"}:
+        themes.append("筋力を伸ばす攻撃プラン")
+    if normalized & {"bash", "uppercut", "shockwave", "thunderclap"}:
+        themes.append("弱体から打点を伸ばすプラン")
+    if normalized & {"feel no pain", "dark embrace", "corruption", "second wind", "true grit", "fiend fire"}:
+        themes.append("廃棄で手札や防御を整えるプラン")
+    if normalized & {"barricade", "body slam", "entrench", "impervious", "shrug it off"}:
+        themes.append("ブロックを厚くするプラン")
+    if normalized & {"cleave", "whirlwind", "immolate", "reaper"}:
+        themes.append("複数敵をまとめて倒すプラン")
+    if normalized & {normalize_name(card) for card in FRONTLOAD_ATTACKS}:
+        themes.append("序盤から高打点で押すプラン")
+    if not themes:
+        attack_count = sum(1 for card in deck if str(card.get("type") or "").upper() == "ATTACK")
+        skill_count = sum(1 for card in deck if str(card.get("type") or "").upper() == "SKILL")
+        if attack_count >= skill_count:
+            themes.append("攻撃を軸に早く倒すプラン")
+        else:
+            themes.append("防御を固めて安全に進めるプラン")
+    return themes
+
+
+def count_card_types(deck: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for card in deck:
+        card_type = str(card.get("type") or "UNKNOWN").upper()
+        counts[card_type] = counts.get(card_type, 0) + 1
+    return counts
+
+
+def interesting_deck_cards(deck: list[dict[str, Any]]) -> list[str]:
+    boring = {"strike", "defend", "strike_r", "defend_r"}
+    cards: list[str] = []
+    for card in deck:
+        name = str(card.get("name") or card.get("id") or "").strip()
+        if not name or normalize_name(name) in boring:
+            continue
+        upgrades = public_int(card.get("upgrades"))
+        suffix = f"+{upgrades}" if upgrades else ""
+        cards.append(f"{name}{suffix}")
+    return cards
+
+
+def public_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def narrator_class_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    aliases = {
+        "IRONCLAD": "アイアンクラッド",
+        "THE_IRONCLAD": "アイアンクラッド",
+        "SILENT": "サイレント",
+        "THE_SILENT": "サイレント",
+        "DEFECT": "ディフェクト",
+        "THE_DEFECT": "ディフェクト",
+        "WATCHER": "ウォッチャー",
+        "THE_WATCHER": "ウォッチャー",
+    }
+    return aliases.get(raw.upper(), raw)
+
+
+def screen_viewer_hook(screen_type: str) -> str:
+    hooks = {
+        "CARD_REWARD": "デッキ方針に合う一枚か、取らずに薄く保つかを相談しやすい場面",
+        "EVENT": "リスクを取るか安全に進むかを相談しやすい場面",
+        "REST": "回復か強化かを相談しやすい場面",
+        "SHOP_SCREEN": "買い物でデッキ方針を伸ばすか守りを補うかを相談しやすい場面",
+        "MAP": "次の部屋で強くなるか体力を守るかを相談しやすい場面",
+        "GRID": "どのカードを選ぶかでデッキの方向が変わる場面",
+        "COMBAT_REWARD": "勝利後に次の強化方針を確認する場面",
+    }
+    return hooks.get(screen_type, "次の判断を短く相談しやすい場面")
+
+
+def screen_beginner_note(screen_type: str, screen_state: dict[str, Any]) -> str:
+    if screen_type == "CARD_REWARD":
+        return "弱いカードを取らない選択も、強いカードを引きやすくする強化になる"
+    if screen_type == "REST":
+        return "休憩所では回復で安全を取るか、強化で先の戦闘を楽にするかを選ぶ"
+    if screen_type == "SHOP_SCREEN":
+        return "ゴールドはカード、レリック、削除のどれでデッキを伸ばすかに使える"
+    if screen_type == "MAP":
+        return "エリートは危険だが、勝てるとレリックで大きく強くなる"
+    if screen_type == "GRID" and screen_state.get("for_purge"):
+        return "削除は弱いカードを減らして強いカードを引きやすくする"
+    if screen_type == "COMBAT_REWARD":
+        return "報酬は今のデッキ方針に合うかで見ると選びやすい"
+    return ""
 
 
 def build_codex_prompt(
@@ -976,20 +1482,43 @@ def build_codex_prompt(
 ) -> str:
     payload = {
         "state": summarize_state(state),
+        "run_theme": build_run_theme(state),
+        "deck_plan": build_deck_plan(state),
+        "choice_context": build_choice_context(state),
         "legal_actions": legal_actions,
         "fallback_action": fallback_command,
     }
     if include_narration:
         payload["narration"] = {
-            "required_fields": ["narration_mode", "narration_text", "narration_emotion"],
+            "required_fields": ["narration_mode", "narration_text", "narration_emotion", "narration_thought"],
             "style": (
                 "Use narration_mode=say or silent. If say, write one short Japanese spoken commentator line, "
-                "12-35 characters when possible. Vary between reaction, tactical explanation, next-turn forecast, "
-                "and flow recap; do not merely restate the action. "
+                "12-35 characters when possible. Vary between visible decision summary, reaction, tactical explanation, "
+                "next-turn forecast, deck-plan note, short viewer consultation, beginner explanation, and flow recap; "
+                "do not merely restate the action. "
+                "Also include narration_thought as one short public Japanese decision note for the UI event log, "
+                "not hidden reasoning or step-by-step deliberation. "
+                "Use deck_plan, run_theme, and choice_context as public context. "
                 "Use Japanese only; rewrite English names into katakana or Japanese. "
+                "Generate spoken monster or boss names inside narration_text, never raw English or empty parentheses. "
+                "When mentioning enemy health, say 残り体力12 or 体力12, not 残り12. "
                 "Use polite speech. Avoid recent_examples. Do not include rationale, command syntax, or English analysis. "
                 "Use narration_emotion as neutral, happy, angry, sad, or thinking."
             ),
+            "examples": [
+                {
+                    "narration_mode": "say",
+                    "narration_text": "ここは攻め切りでいいでしょうか？",
+                    "narration_emotion": "thinking",
+                    "narration_thought": "デッキ方針に合わせて攻めを優先します。",
+                },
+                {
+                    "narration_mode": "say",
+                    "narration_text": "弱い一枚は取らないのも強化です。",
+                    "narration_emotion": "neutral",
+                    "narration_thought": "山札を薄く保つと強い札を引きやすいです。",
+                },
+            ],
         }
         recent_examples = recent_narration_examples or recent_narrations or []
         if recent_examples:
@@ -997,7 +1526,8 @@ def build_codex_prompt(
     shape = (
         '{"action_id":"<one legal action_id>","rationale":"<brief reason>",'
         '"narration_mode":"say|silent","narration_text":"<short Japanese spoken line or empty>",'
-        '"narration_emotion":"neutral|happy|angry|sad|thinking"}'
+        '"narration_emotion":"neutral|happy|angry|sad|thinking",'
+        '"narration_thought":"<short public Japanese decision note>"}'
         if include_narration
         else '{"action_id":"<one legal action_id>","rationale":"<brief reason>"}'
     )
@@ -1066,13 +1596,14 @@ def run_openai_responses_api(
     options: Options,
     api_key: str,
 ) -> dict[str, Any]:
+    include_narration = options.narration_ui and "narration" in payload
     properties: dict[str, Any] = {
         "action_id": {"type": "string", "enum": action_ids},
         "rationale": {"type": "string"},
         "confidence": {"type": "number"},
     }
     required = ["action_id", "rationale", "confidence"]
-    if options.narration_ui:
+    if include_narration:
         properties["narration_mode"] = {
             "type": "string",
             "enum": ["say", "silent"],
@@ -1087,7 +1618,11 @@ def run_openai_responses_api(
             "enum": ["neutral", "happy", "angry", "sad", "thinking"],
             "description": "Emotion sent to the narration runtime UI.",
         }
-        required.extend(["narration_mode", "narration_text", "narration_emotion"])
+        properties["narration_thought"] = {
+            "type": "string",
+            "description": "One short public Japanese decision note for the UI event log; not hidden chain-of-thought or step-by-step reasoning.",
+        }
+        required.extend(["narration_mode", "narration_text", "narration_emotion", "narration_thought"])
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -1098,12 +1633,14 @@ def run_openai_responses_api(
         "You are a Slay the Spire policy engine. Choose one action_id from the provided "
         "legal_actions. Return only the structured JSON object. Do not invent actions."
     )
-    if options.narration_ui:
+    if include_narration:
         system_prompt += (
             " Also choose narration_mode, narration_text, and narration_emotion for a live game narrator. "
             "Use silent for low-value repeated transitions. Spoken lines must be natural Japanese commentary, "
-            "not rationale. Vary between reaction, tactical explanation, next-turn forecast, and flow recap. "
-            "They must not include English analysis or command syntax. Use only the official "
+            "not rationale. Vary between visible decision summary, reaction, tactical explanation, next-turn forecast, "
+            "deck-plan note, beginner explanation, short viewer consultation, and flow recap. "
+            "Also include narration_thought as a short public Japanese decision note for the UI event log, "
+            "not hidden chain-of-thought or step-by-step reasoning. They must not include English analysis or command syntax. Use only the official "
             "emotions neutral, happy, angry, sad, and thinking."
         )
     request_body = {
@@ -1126,7 +1663,7 @@ def run_openai_responses_api(
                 "schema": schema,
             }
         },
-        "max_output_tokens": 450 if options.narration_ui else 300,
+        "max_output_tokens": 520 if include_narration else 300,
         "store": False,
     }
 
@@ -1185,9 +1722,20 @@ def run_openai_narration_api(
                 "enum": ["neutral", "happy", "angry", "sad", "thinking"],
                 "description": "Emotion sent to the narration runtime UI.",
             },
+            "narration_thought": {
+                "type": "string",
+                "description": "One short public Japanese note for the UI event log; not hidden chain-of-thought or step-by-step reasoning.",
+            },
             "confidence": {"type": "number"},
         },
-        "required": ["rationale", "narration_mode", "narration_text", "narration_emotion", "confidence"],
+        "required": [
+            "rationale",
+            "narration_mode",
+            "narration_text",
+            "narration_emotion",
+            "narration_thought",
+            "confidence",
+        ],
     }
     request_body = {
         "model": options.openai_model,
@@ -1198,6 +1746,10 @@ def run_openai_narration_api(
                     "You write only the narration fields for a Slay the Spire live narrator. "
                     "Do not choose a game action. Return only the structured JSON object. "
                     "Spoken lines must be natural Japanese, polite, varied, and free of English or command syntax. "
+                    "Use public context to vary between visible decision summary, reaction, deck-plan note, beginner explanation, "
+                    "short viewer consultation, failure reaction, or victory reaction as appropriate. "
+                    "narration_thought is one short public Japanese note for the UI event log, not hidden chain-of-thought "
+                    "or step-by-step reasoning. "
                     "Use only the official emotions neutral, happy, angry, sad, and thinking."
                 ),
             },
@@ -1376,7 +1928,8 @@ def write_codex_output_schema(*, include_narration: bool = False) -> str:
         properties["narration_mode"] = {"type": "string", "enum": ["say", "silent"]}
         properties["narration_text"] = {"type": "string"}
         properties["narration_emotion"] = {"type": "string", "enum": ["neutral", "happy", "angry", "sad", "thinking"]}
-        required.extend(["narration_mode", "narration_text", "narration_emotion"])
+        properties["narration_thought"] = {"type": "string"}
+        required.extend(["narration_mode", "narration_text", "narration_emotion", "narration_thought"])
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -1400,6 +1953,34 @@ def normalize_narration_text(value: Any) -> str | None:
     if len(text) > 80:
         text = text[:80].rstrip("、。,. ") + "。"
     return text
+
+
+def normalize_narration_thought(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text:
+        return None
+    forbidden_markers = (
+        "action_id",
+        "PLAY ",
+        "CHOOSE ",
+        "END",
+        "STATE",
+        "chain-of-thought",
+        "chain of thought",
+        "step-by-step",
+        "rationale",
+    )
+    for marker in forbidden_markers:
+        text = re.sub(re.escape(marker), "", text, flags=re.IGNORECASE).strip()
+    text = text.replace("/", "対").replace("_", "")
+    text = re.sub(r"[A-Za-z][A-Za-z0-9' -]*", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^[、。,. !！?？]+", "", text).strip()
+    if len(text) > 70:
+        text = text[:70].rstrip("、。,. ") + "。"
+    return text or None
 
 
 def normalize_narration_mode(value: Any) -> str | None:
@@ -2109,7 +2690,9 @@ def monster_incoming_damage(monster: dict[str, Any]) -> int:
     intent = str(monster.get("intent") or "").upper()
     if "ATTACK" not in intent and intent not in {"DEBUG", "UNKNOWN"}:
         return 0
-    damage = int(monster.get("move_adjusted_damage") or monster.get("move_base_damage") or 0)
+    adjusted = public_int(monster.get("move_adjusted_damage"), -1)
+    base = public_int(monster.get("move_base_damage"))
+    damage = adjusted if adjusted > 0 else base
     hits = int(monster.get("move_hits") or 1)
     if damage <= 0:
         return 0
