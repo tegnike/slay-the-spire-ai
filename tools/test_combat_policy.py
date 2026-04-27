@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+import os
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import sts_ai_player
+from _sts_ai_player.models import Options
 
 
 def attack(name: str, damage_id: str | None = None, cost: int = 1, upgrades: int = 0) -> dict:
@@ -37,6 +39,32 @@ def skill(name: str, block_id: str | None = None, cost: int = 1, upgrades: int =
         "is_playable": True,
         "has_target": False,
     }
+
+
+def options(**overrides) -> Options:
+    defaults = {
+        "auto_start": False,
+        "character": "IRONCLAD",
+        "ascension": 0,
+        "seed": None,
+        "stop_on_game_over": True,
+        "max_floor": None,
+        "use_openai_api": False,
+        "openai_model": "gpt-5.4-mini",
+        "openai_api_base": "https://api.openai.com/v1",
+        "openai_timeout": 20.0,
+        "use_codex": False,
+        "codex_model": "gpt-5.4-mini",
+        "codex_command": "codex",
+        "codex_timeout": 30.0,
+        "narration_ui": False,
+        "narration_url": "ws://localhost:5175/ws/narration",
+        "narration_speaker": "nike",
+        "narration_wait": False,
+        "narration_timeout": 12.0,
+    }
+    defaults.update(overrides)
+    return Options(**defaults)
 
 
 class CombatPolicyTests(unittest.TestCase):
@@ -319,6 +347,124 @@ class CombatPolicyTests(unittest.TestCase):
         self.assertIn("narration", with_narration)
         self.assertNotIn("narration_text", codex_without)
         self.assertIn("narration_text", codex_with)
+
+    def test_shop_room_with_insufficient_gold_only_exposes_proceed(self):
+        sts_ai_player.SHOP_VISITED_KEYS.clear()
+        state = {
+            "seed": 123,
+            "act": 1,
+            "floor": 11,
+            "screen_type": "SHOP_ROOM",
+            "choice_list": ["shop"],
+            "screen_state": {},
+            "gold": 2,
+        }
+
+        actions = sts_ai_player.build_legal_actions(
+            state,
+            {"choose", "proceed"},
+            "PROCEED",
+            include_fallback_action=False,
+        )
+
+        self.assertEqual({action.command for action in actions}, {"PROCEED"})
+
+    def test_shop_room_does_not_reenter_after_shop_screen_was_seen(self):
+        sts_ai_player.SHOP_VISITED_KEYS.clear()
+        shop_state = {
+            "seed": 123,
+            "act": 1,
+            "floor": 11,
+            "screen_type": "SHOP_SCREEN",
+            "screen_state": {"cards": [], "relics": [], "potions": [], "purge_available": False},
+            "gold": 200,
+        }
+        room_state = {
+            "seed": 123,
+            "act": 1,
+            "floor": 11,
+            "screen_type": "SHOP_ROOM",
+            "choice_list": ["shop"],
+            "screen_state": {},
+            "gold": 200,
+        }
+
+        sts_ai_player.build_legal_actions(shop_state, {"leave"}, "LEAVE", include_fallback_action=False)
+        actions = sts_ai_player.build_legal_actions(
+            room_state,
+            {"choose", "proceed"},
+            "PROCEED",
+            include_fallback_action=False,
+        )
+
+        self.assertEqual({action.command for action in actions}, {"PROCEED"})
+
+    def test_game_over_pause_requests_one_shot_openai_narration(self):
+        sts_ai_player.PAUSE_NARRATION_KEYS.clear()
+        previous_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        calls: list[dict] = []
+        original = sts_ai_player.run_openai_narration_api
+
+        def fake_run_openai_narration_api(payload, option_values, api_key):
+            calls.append(payload)
+            return {
+                "rationale": "terminal narration",
+                "narration_mode": "say",
+                "narration_text": "ここで倒れましたが、最後まで攻め切りました。",
+                "narration_emotion": "sad",
+                "confidence": 0.9,
+            }
+
+        raw = {
+            "in_game": True,
+            "available_commands": ["proceed", "wait", "state"],
+            "_sts_ai_log_index": 138,
+            "_sts_ai_recent_narrations": ["次のターンへつなげます。"],
+            "game_state": {
+                "seed": 123,
+                "act": 1,
+                "floor": 16,
+                "screen_type": "GAME_OVER",
+                "screen_name": "DEATH",
+                "current_hp": 0,
+                "max_hp": 80,
+            },
+        }
+
+        try:
+            sts_ai_player.run_openai_narration_api = fake_run_openai_narration_api
+            command = sts_ai_player.choose_command(
+                raw,
+                options(use_openai_api=True, narration_ui=True),
+            )
+            repeated_raw = {
+                **raw,
+                "_sts_ai_narration_text": "",
+                "_sts_ai_narration_mode": "",
+                "_sts_ai_narration_emotion": "",
+            }
+            repeated_command = sts_ai_player.choose_command(
+                repeated_raw,
+                options(use_openai_api=True, narration_ui=True),
+            )
+        finally:
+            sts_ai_player.run_openai_narration_api = original
+            if previous_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = previous_key
+
+        self.assertEqual(command, "WAIT 300")
+        self.assertEqual(raw["_sts_ai_narration_event"], "game_over")
+        self.assertEqual(raw["_sts_ai_narration_mode"], "say")
+        self.assertEqual(raw["_sts_ai_narration_text"], "ここで倒れましたが、最後まで攻め切りました。")
+        self.assertEqual(raw["_sts_ai_narration_emotion"], "sad")
+        self.assertEqual(calls[0]["event"]["type"], "game_over")
+        self.assertEqual(calls[0]["narration"]["recent_examples"], ["次のターンへつなげます。"])
+        self.assertEqual(repeated_command, "WAIT 300")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(repeated_raw["_sts_ai_narration_mode"], "silent")
 
     def test_rest_prefers_heal_before_forced_elite_route(self):
         state = {

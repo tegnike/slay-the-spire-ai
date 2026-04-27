@@ -59,6 +59,16 @@ def combat_raw() -> dict[str, Any]:
     }
 
 
+def combat_raw_with_incoming() -> dict[str, Any]:
+    raw = combat_raw()
+    combat = raw["game_state"]["combat_state"]
+    combat["hand"] = [attack("Strike", "Strike_R")]
+    combat["player"]["block"] = 0
+    combat["monsters"][0]["current_hp"] = 30
+    combat["monsters"][0]["move_adjusted_damage"] = 12
+    return raw
+
+
 def screen_raw(screen_type: str = "COMBAT_REWARD") -> dict[str, Any]:
     return {
         "game_state": {
@@ -137,6 +147,31 @@ class NarrationImprovementTests(unittest.TestCase):
         self.assertNotIn("game_state", cue)
         self.assertNotIn("combat_state", cue)
 
+    def test_spoken_text_rewrites_english_names_and_keeps_polite_tone(self):
+        text = narration.sanitize_spoken_text("Pommel StrikeでJaw Wormを倒し切れ！")
+
+        self.assertNotRegex(text, r"[A-Za-z]")
+        self.assertIn("ポンメルストライク", text)
+        self.assertIn("ジョー・ワーム", text)
+        self.assertIn("倒し切りましょう", text)
+
+    def test_spoken_text_removes_leading_punctuation_after_english_cleanup(self):
+        text = narration.sanitize_spoken_text("Dropkick、ここで押し込みます！")
+
+        self.assertNotRegex(text, r"^[、。,.]")
+        self.assertIn("ドロップキック", text)
+
+    def test_director_sanitizes_model_text_before_speaking(self):
+        director_cls = require_director(self)
+        cue = cue_to_dict(director_cls().choose(combat_raw(), "PLAY 1 0", "StrikeでJaw Wormを倒し切れ！"))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertNotRegex(cue["text"], r"[A-Za-z]")
+        self.assertIn("ストライク", cue["text"])
+        self.assertIn("ジョー・ワーム", cue["text"])
+        self.assertRegex(cue["text"], r"(ます|です|ましょう|！|。)$")
+
     def test_director_avoids_repeating_recent_combat_lines(self):
         director_cls = require_director(self)
         director = director_cls()
@@ -149,6 +184,117 @@ class NarrationImprovementTests(unittest.TestCase):
         assert first is not None
         assert second is not None
         self.assertNotEqual(second.get("text"), first.get("text"))
+
+    def test_director_blocks_repeated_opening_phrase_from_model_text(self):
+        director_cls = require_director(self)
+        director = director_cls()
+        director.record(
+            narration.NarrationCue("よし、まずは一体ずつ削っていきます！", importance=3),
+            "COMBAT:PLAY",
+        )
+
+        cue = cue_to_dict(director.choose(combat_raw(), "PLAY 1 0", "よし、まず一体を倒し切ります！"))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertFalse(cue["text"].startswith("よし、"), cue["text"])
+
+    def test_director_varies_repeated_model_battle_calls(self):
+        director_cls = require_director(self)
+        director = director_cls()
+        proposals = [
+            "よし、まずは一体ずつ削っていきます！",
+            "よし、まず一体を倒し切ります！",
+            "よし、ここで取り切ります！",
+        ]
+
+        lines = [cue_to_dict(director.choose(combat_raw(), "PLAY 1 0", text))["text"] for text in proposals]
+
+        self.assertNotEqual(lines[0], "よし、まずは一体ずつ削っていきます！")
+        self.assertIn("ジョー・ワーム", lines[0])
+        self.assertFalse(lines[1].startswith("よし、"), lines)
+        self.assertFalse(lines[2].startswith("よし、"), lines)
+        self.assertNotIn("倒し切", lines[2])
+        self.assertNotIn("取り切", lines[2])
+
+    def test_director_prefers_concrete_commentary_over_bland_model_text(self):
+        director_cls = require_director(self)
+        cue = cue_to_dict(director_cls().choose(combat_raw_with_incoming(), "PLAY 1 0", "よし、まずは一発入れていきます！"))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertNotEqual(cue["text"], "よし、まずは一発入れていきます！")
+        self.assertRegex(cue["text"], r"(12|残り|被弾|次)")
+
+    def test_director_rotates_commentary_angles_for_combat(self):
+        director_cls = require_director(self)
+        director = director_cls()
+        lines = [
+            cue_to_dict(director.choose(combat_raw_with_incoming(), "PLAY 1 0", "よし、まずは一発入れていきます！"))[
+                "text"
+            ]
+            for _ in range(3)
+        ]
+
+        self.assertGreaterEqual(len(set(lines)), 3)
+        self.assertTrue(any("12" in line or "被弾" in line for line in lines), lines)
+        self.assertTrue(any("次" in line for line in lines), lines)
+
+    def test_director_speaks_for_forced_game_over_wait_event(self):
+        director_cls = require_director(self)
+        raw = {
+            "game_state": {
+                "act": 1,
+                "floor": 16,
+                "screen_type": "GAME_OVER",
+                "screen_name": "DEATH",
+                "current_hp": 0,
+                "max_hp": 80,
+            },
+            "_sts_ai_narration_event": "game_over",
+            "_sts_ai_narration_mode": "say",
+            "_sts_ai_narration_text": "ここで倒れましたが、最後まで攻め切りました。",
+            "_sts_ai_narration_emotion": "sad",
+        }
+
+        cue = cue_to_dict(director_cls().choose(raw, "WAIT 300", raw["_sts_ai_narration_text"]))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue["text"], "ここで倒れましたが、最後まで攻め切りました。")
+        self.assertEqual(cue["emotion"], "sad")
+        self.assertEqual(cue["reason"], "game_over")
+        self.assertEqual(cue["queue_policy"], "replaceIfHigherPriority")
+
+    def test_director_honors_silent_for_forced_pause_event(self):
+        director_cls = require_director(self)
+        director = director_cls()
+        raw = {
+            "game_state": {"screen_type": "GAME_OVER", "screen_name": "DEATH", "floor": 16},
+            "_sts_ai_narration_event": "game_over",
+            "_sts_ai_narration_mode": "silent",
+        }
+
+        cue = cue_to_dict(director.choose(raw, "WAIT 300", None))
+
+        self.assertIsNone(cue)
+        self.assertEqual(director.last_suppression_reason(), "model_silent")
+
+    def test_director_blocks_recent_low_importance_motif(self):
+        director_cls = require_director(self)
+        director = director_cls()
+        director.record(
+            narration.NarrationCue("相手の体力を削っておきます。", importance=2),
+            "COMBAT:PLAY",
+        )
+        raw = combat_raw()
+        raw["game_state"]["combat_state"]["monsters"][0]["current_hp"] = 30
+
+        cue = cue_to_dict(director.choose(raw, "PLAY 1 0", "ここで削ります！"))
+
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertNotIn("削", cue["text"])
 
     def test_director_may_skip_low_value_repeated_commands(self):
         director_cls = require_director(self)
@@ -184,7 +330,7 @@ class NarrationImprovementTests(unittest.TestCase):
         client._send_json = sent.append  # type: ignore[method-assign]
 
         status = client.say(
-            "いけーー！",
+            "Strikeでいけーー！",
             emotion="happy",
             pace="fast",
             intensity="high",
@@ -196,6 +342,8 @@ class NarrationImprovementTests(unittest.TestCase):
 
         self.assertEqual(status, "sent")
         self.assertEqual(sent[0]["type"], "narration:say")
+        self.assertNotRegex(sent[0]["text"], r"[A-Za-z]")
+        self.assertIn("ストライク", sent[0]["text"])
         self.assertEqual(sent[0]["pace"], "fast")
         self.assertEqual(sent[0]["intensity"], "high")
         self.assertEqual(sent[0]["priority"], 9)

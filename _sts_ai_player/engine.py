@@ -47,6 +47,7 @@ LAST_CHOSEN_MAP_NODE: dict[str, Any] | None = None
 OFFICIAL_NARRATION_EMOTIONS = {"neutral", "happy", "angry", "sad", "thinking"}
 
 SHOP_VISITED_KEYS: set[tuple[str, int, int]] = set()
+PAUSE_NARRATION_KEYS: set[tuple[str, str, int, int]] = set()
 
 
 def setup_logging() -> None:
@@ -103,7 +104,9 @@ def normalize_start_seed(seed: str | None, seed_long: str | None = None) -> str 
 
 
 def choose_command(raw: dict[str, Any], options: Options) -> str:
-    if should_pause_run(raw, options):
+    pause_reason_value = pause_reason(raw, options)
+    if pause_reason_value:
+        prepare_pause_narration(raw, options, pause_reason_value)
         return pause_command(raw)
 
     rule_command = choose_rule_command(raw, options)
@@ -138,21 +141,128 @@ def should_skip_codex(raw: dict[str, Any]) -> bool:
 
 
 def should_pause_run(raw: dict[str, Any], options: Options) -> bool:
+    return pause_reason(raw, options) is not None
+
+
+def pause_reason(raw: dict[str, Any], options: Options) -> str | None:
     if "error" in raw:
-        return False
+        return None
 
     state = raw.get("game_state") or {}
     screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
     if options.stop_on_game_over and screen_type in {"GAME_OVER", "DEATH"}:
         logging.info("Pausing on game over screen")
-        return True
+        return "game_over"
 
     if options.max_floor is not None:
         floor = int(state.get("floor") or 0)
         if floor >= options.max_floor:
             logging.info("Pausing because max floor reached: floor=%s max_floor=%s", floor, options.max_floor)
-            return True
-    return False
+            return "max_floor"
+    return None
+
+
+def prepare_pause_narration(raw: dict[str, Any], options: Options, reason: str) -> None:
+    if not options.narration_ui:
+        return
+    key = pause_narration_key(raw, reason)
+    raw["_sts_ai_narration_event"] = reason
+    raw["_sts_ai_action_description"] = pause_narration_description(reason)
+    if key in PAUSE_NARRATION_KEYS:
+        raw["_sts_ai_narration_mode"] = "silent"
+        raw["_sts_ai_narration_emotion"] = "neutral"
+        return
+
+    PAUSE_NARRATION_KEYS.add(key)
+    if not options.use_openai_api:
+        raw["_sts_ai_narration_mode"] = "silent"
+        raw["_sts_ai_narration_emotion"] = "neutral"
+        return
+
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("STS_AI_OPENAI_API_KEY")
+    if not api_key or OPENAI_API_DISABLED_REASON:
+        raw["_sts_ai_narration_mode"] = "silent"
+        raw["_sts_ai_narration_emotion"] = "neutral"
+        return
+
+    pause_payload = build_pause_narration_payload(
+        raw,
+        reason,
+        recent_narrations=normalize_recent_narrations(raw.get("_sts_ai_recent_narrations")),
+    )
+    append_jsonl(
+        "openai_requests.jsonl",
+        {
+            "time": time.time(),
+            "state_index": raw.get("_sts_ai_log_index"),
+            "process_id": raw.get("_sts_ai_process_id"),
+            "model": options.openai_model,
+            "request_type": "pause_narration",
+            "pause_reason": reason,
+            "payload": pause_payload,
+        },
+    )
+
+    try:
+        decision = run_openai_narration_api(
+            pause_payload,
+            options,
+            api_key,
+        )
+    except Exception:
+        logging.exception("OpenAI pause narration failed; continuing silently")
+        raw["_sts_ai_narration_mode"] = "silent"
+        raw["_sts_ai_narration_emotion"] = "neutral"
+        return
+
+    narration_text = normalize_narration_text(decision.get("narration_text"))
+    narration_mode = normalize_narration_mode(decision.get("narration_mode")) or ("say" if narration_text else "silent")
+    narration_emotion = normalize_narration_emotion(decision.get("narration_emotion")) or pause_narration_emotion(reason)
+    if narration_text:
+        raw["_sts_ai_narration_text"] = narration_text
+    raw["_sts_ai_narration_mode"] = narration_mode
+    raw["_sts_ai_narration_emotion"] = narration_emotion
+    append_jsonl(
+        "openai_decisions.jsonl",
+        {
+            "time": time.time(),
+            "state_index": raw.get("_sts_ai_log_index"),
+            "process_id": raw.get("_sts_ai_process_id"),
+            "model": options.openai_model,
+            "action_id": f"pause_{reason}_narration",
+            "command": pause_command(raw),
+            "model_command": pause_command(raw),
+            "rationale": decision.get("rationale", ""),
+            "narration_mode": narration_mode,
+            "narration_text": narration_text,
+            "narration_emotion": narration_emotion,
+            "confidence": decision.get("confidence"),
+            "fallback": pause_command(raw),
+            "override_reason": None,
+        },
+    )
+
+
+def pause_narration_key(raw: dict[str, Any], reason: str) -> tuple[str, str, int, int]:
+    state = raw.get("game_state") or {}
+    return (
+        reason,
+        str(state.get("seed") or ""),
+        int(state.get("act") or 0),
+        int(state.get("floor") or 0),
+    )
+
+
+def pause_narration_description(reason: str) -> str:
+    if reason == "game_over":
+        return "Narrate the game over screen before pausing the run."
+    if reason == "max_floor":
+        return "Narrate that the configured stopping floor has been reached."
+    return "Narrate the pause point before waiting."
+
+
+def pause_narration_emotion(reason: str) -> str:
+    return "sad" if reason == "game_over" else "thinking"
 
 
 def pause_command(raw: dict[str, Any]) -> str:
@@ -789,22 +899,69 @@ def build_decision_payload(
             "style": [
                 "Choose narration_mode=say for moments worth hearing, or silent for low-value repeated transitions.",
                 "When saying something, write one short Japanese spoken line for a game commentator.",
-                "Keep it natural, reactive, and energetic, not explanatory.",
+                "Vary the angle like a real commentator: live reaction, tactical explanation, next-turn forecast, or flow recap.",
+                "Do not merely restate the action. Prefer why it matters, what it sets up, or what risk remains.",
+                "Write Japanese only. Do not include English words or roman letters.",
+                "If a card, relic, monster, or game term is English, rewrite it in Japanese katakana or a Japanese translation.",
+                "Use polite speech matching the narrator character. Avoid rough imperatives or casual endings.",
                 "Do not include the rationale, chain-of-thought, action_id, command syntax, or English strategic analysis.",
-                "Mention the concrete move or situation in plain Japanese.",
-                "Avoid repeating recent_examples. Use short hype lines like よっしゃ！ or いけーー！ when the moment is exciting.",
+                "Mention concrete game facts when useful: remaining HP, incoming damage, block, next turn, or route pressure.",
+                "Avoid repeating recent_examples, especially the same opener or the same tactical meaning.",
                 "Use narration_emotion as one of neutral, happy, angry, sad, thinking.",
                 "Aim for 12 to 35 Japanese characters. Maximum 60 characters.",
             ],
             "examples": [
-                {"narration_mode": "say", "narration_text": "いけーー！ここで倒し切る！", "narration_emotion": "happy"},
-                {"narration_mode": "say", "narration_text": "うわ、ここは踏ん張りどころ。", "narration_emotion": "sad"},
+                {"narration_mode": "say", "narration_text": "ここで落とせると次がかなり楽です。", "narration_emotion": "happy"},
+                {"narration_mode": "say", "narration_text": "被弾は残りますが、先に倒す判断です。", "narration_emotion": "thinking"},
                 {"narration_mode": "silent", "narration_text": "", "narration_emotion": "neutral"},
             ],
         }
         recent_examples = recent_narration_examples or recent_narrations or []
         if recent_examples:
             payload["narration"]["recent_examples"] = recent_examples[-8:]
+    return payload
+
+
+def build_pause_narration_payload(
+    raw: dict[str, Any],
+    reason: str,
+    *,
+    recent_narrations: list[str] | None = None,
+) -> dict[str, Any]:
+    state = raw.get("game_state") or {}
+    if not isinstance(state, dict):
+        state = {}
+    event_descriptions = {
+        "game_over": "The run has just reached the game over screen and the AI will pause instead of proceeding.",
+        "max_floor": "The configured stopping floor has been reached and the AI will pause instead of proceeding.",
+    }
+    payload: dict[str, Any] = {
+        "event": {
+            "type": reason,
+            "description": event_descriptions.get(reason, "The run is pausing before another mechanical command."),
+            "command_after_narration": pause_command(raw),
+        },
+        "state": summarize_state(state),
+        "narration": {
+            "required_fields": ["narration_mode", "narration_text", "narration_emotion"],
+            "style": [
+                "Choose narration_mode=say unless recent_examples already covered this same moment.",
+                "Write one short Japanese spoken line for a polite live narrator.",
+                "Do not use a fixed template. React to the actual run state: floor, HP, boss or monster, deck, and final risk.",
+                "For game_over, close the run with a natural, varied line that fits how it ended.",
+                "For max_floor, explain that this is the configured pause point without sounding like a system message.",
+                "Write Japanese only. Do not include English words or roman letters.",
+                "If a card, relic, monster, or game term is English, rewrite it in Japanese katakana or a Japanese translation.",
+                "Use polite speech matching the narrator character.",
+                "Do not include the rationale, command syntax, or English strategic analysis.",
+                "Avoid repeating recent_examples, especially the same opener or ending.",
+                "Use narration_emotion as one of neutral, happy, angry, sad, thinking.",
+                "Aim for 16 to 45 Japanese characters. Maximum 70 characters.",
+            ],
+        },
+    }
+    if recent_narrations:
+        payload["narration"]["recent_examples"] = recent_narrations[-8:]
     return payload
 
 
@@ -827,8 +984,10 @@ def build_codex_prompt(
             "required_fields": ["narration_mode", "narration_text", "narration_emotion"],
             "style": (
                 "Use narration_mode=say or silent. If say, write one short Japanese spoken commentator line, "
-                "12-35 characters when possible, with reactive variety and occasional hype like よっしゃ！ or いけーー！. "
-                "Avoid recent_examples. Do not include rationale, command syntax, or English analysis. "
+                "12-35 characters when possible. Vary between reaction, tactical explanation, next-turn forecast, "
+                "and flow recap; do not merely restate the action. "
+                "Use Japanese only; rewrite English names into katakana or Japanese. "
+                "Use polite speech. Avoid recent_examples. Do not include rationale, command syntax, or English analysis. "
                 "Use narration_emotion as neutral, happy, angry, sad, or thinking."
             ),
         }
@@ -943,7 +1102,8 @@ def run_openai_responses_api(
         system_prompt += (
             " Also choose narration_mode, narration_text, and narration_emotion for a live game narrator. "
             "Use silent for low-value repeated transitions. Spoken lines must be natural Japanese commentary, "
-            "not rationale, and must not include English analysis or command syntax. Use only the official "
+            "not rationale. Vary between reaction, tactical explanation, next-turn forecast, and flow recap. "
+            "They must not include English analysis or command syntax. Use only the official "
             "emotions neutral, happy, angry, sad, and thinking."
         )
     request_body = {
@@ -998,6 +1158,94 @@ def run_openai_responses_api(
     decision = json.loads(output_text)
     if not isinstance(decision, dict):
         raise ValueError("OpenAI API decision was not a JSON object")
+    return decision
+
+
+def run_openai_narration_api(
+    payload: dict[str, Any],
+    options: Options,
+    api_key: str,
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "rationale": {"type": "string"},
+            "narration_mode": {
+                "type": "string",
+                "enum": ["say", "silent"],
+                "description": "Whether this pause point deserves spoken narration.",
+            },
+            "narration_text": {
+                "type": "string",
+                "description": "One short, natural Japanese spoken commentary line, or empty when narration_mode is silent.",
+            },
+            "narration_emotion": {
+                "type": "string",
+                "enum": ["neutral", "happy", "angry", "sad", "thinking"],
+                "description": "Emotion sent to the narration runtime UI.",
+            },
+            "confidence": {"type": "number"},
+        },
+        "required": ["rationale", "narration_mode", "narration_text", "narration_emotion", "confidence"],
+    }
+    request_body = {
+        "model": options.openai_model,
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "You write only the narration fields for a Slay the Spire live narrator. "
+                    "Do not choose a game action. Return only the structured JSON object. "
+                    "Spoken lines must be natural Japanese, polite, varied, and free of English or command syntax. "
+                    "Use only the official emotions neutral, happy, angry, sad, and thinking."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "sts_pause_narration",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+        "max_output_tokens": 300,
+        "store": False,
+    }
+
+    url = options.openai_api_base.rstrip("/") + "/responses"
+    started = time.time()
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=options.openai_timeout) as response:
+            response_text = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[-2000:]
+        logging.warning("openai_pause_narration http_status=%s body=%s", error.code, detail)
+        raise
+
+    elapsed = time.time() - started
+    parsed = json.loads(response_text)
+    output_text = extract_response_text(parsed)
+    logging.info("openai_pause_narration elapsed=%.2f model=%s", elapsed, options.openai_model)
+    if not output_text:
+        raise ValueError("OpenAI pause narration response did not contain output text")
+    decision = json.loads(output_text)
+    if not isinstance(decision, dict):
+        raise ValueError("OpenAI pause narration decision was not a JSON object")
     return decision
 
 
@@ -1643,7 +1891,14 @@ def add_shop_actions(
     screen_state: dict[str, Any],
     available: set[str],
 ) -> None:
-    if "choose" in available:
+    screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
+    if screen_type == "SHOP_SCREEN":
+        mark_shop_visited(state)
+
+    if screen_type == "SHOP_ROOM" and "proceed" in available:
+        actions.append(LegalAction("shop_proceed", "PROCEED", "Skip this shop room and proceed."))
+
+    if "choose" in available and (screen_type != "SHOP_ROOM" or should_enter_shop_room(state)):
         choices = screen_choices(state, screen_state)
         for index, choice in enumerate(choices):
             actions.append(LegalAction(f"shop_choose_{index}", f"CHOOSE {index}", f"Buy or select shop option: {choice}."))

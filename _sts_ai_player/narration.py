@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import struct
@@ -22,6 +23,42 @@ OFFICIAL_EMOTIONS = {"neutral", "happy", "angry", "sad", "thinking"}
 SUPPORTED_PACES = {"slow", "normal", "fast"}
 SUPPORTED_INTENSITIES = {"low", "normal", "high"}
 SUPPORTED_QUEUE_POLICIES = {"enqueue", "dropIfBusy", "replaceIfHigherPriority"}
+SPOKEN_NAME_REPLACEMENTS = {
+    "Act": "アクト",
+    "HP": "体力",
+    "Ironclad": "アイアンクラッド",
+    "Neow": "ネオー",
+    "Neow's Lament": "ネオーの哀歌",
+    "Burning Blood": "バーニングブラッド",
+    "Strike_R": "ストライク",
+    "Strike_G": "ストライク",
+    "Strike_B": "ストライク",
+    "Strike_P": "ストライク",
+    "Strike": "ストライク",
+    "Defend_R": "防御",
+    "Defend_G": "防御",
+    "Defend_B": "防御",
+    "Defend_P": "防御",
+    "Defend": "防御",
+    "Bash": "バッシュ",
+    "Dropkick": "ドロップキック",
+    "Thunderclap": "サンダークラップ",
+    "Clash": "クラッシュ",
+    "Rage": "激怒",
+    "Pommel Strike": "ポンメルストライク",
+    "Headbutt": "ヘッドバット",
+    "Anger": "怒り",
+    "Twin Strike": "ツインストライク",
+    "Wild Strike": "ワイルドストライク",
+    "Perfected Strike": "パーフェクトストライク",
+    "Jaw Worm": "ジョー・ワーム",
+    "Gremlin Nob": "グレムリンノブ",
+    "Lagavulin": "ラガヴーリン",
+    "Sentry": "セントリー",
+    "Sentries": "セントリー",
+    "Cultist": "カルト信者",
+    "Louse": "ラウス",
+}
 
 
 @dataclass
@@ -100,6 +137,9 @@ class NarrationUIClient:
     ) -> str:
         self._last_status_reason = None
         text = text.strip()
+        if not text:
+            return "empty"
+        text = sanitize_spoken_text(text)
         if not text:
             return "empty"
         if emotion not in OFFICIAL_EMOTIONS:
@@ -412,6 +452,9 @@ class NarrationDirector:
     def __init__(self, *, history_size: int = 8) -> None:
         self._recent_texts: deque[str] = deque(maxlen=history_size)
         self._recent_keys: deque[str] = deque(maxlen=history_size)
+        self._recent_openers: deque[str] = deque(maxlen=4)
+        self._recent_motifs: deque[str] = deque(maxlen=6)
+        self._recent_angles: deque[str] = deque(maxlen=5)
         self._skip_streak = 0
         self._last_suppression_reason: str | None = None
         self._last_suppression_text: str | None = None
@@ -428,14 +471,15 @@ class NarrationDirector:
     def choose(self, raw: dict[str, Any], command: str, model_text: str | None = None) -> NarrationCue | None:
         self._last_suppression_reason = None
         self._last_suppression_text = None
-        if not should_narrate_command(command):
+        force_narration = bool(raw.get("_sts_ai_force_narration") or raw.get("_sts_ai_narration_event"))
+        if not force_narration and not should_narrate_command(command):
             self._mark_suppressed("non_speech_command", f"{command} は実況対象外です。")
             return None
 
         context = _classify_context(raw, command)
         key = str(context["key"])
         importance = int(context["importance"])
-        if str(raw.get("_sts_ai_narration_mode") or "").lower() == "silent" and importance <= 2:
+        if str(raw.get("_sts_ai_narration_mode") or "").lower() == "silent" and (force_narration or importance <= 2):
             self._recent_keys.append(key)
             self._skip_streak += 1
             self._mark_suppressed("model_silent", "モデルが低価値な実況を抑制しました。")
@@ -449,7 +493,7 @@ class NarrationDirector:
         candidates = build_narration_candidates(raw, command, model_text=model_text, context=context)
         for text in candidates:
             normalized = _normalize_for_repeat(text)
-            if normalized and not self._was_recent(normalized):
+            if normalized and not self._was_recent(normalized) and not self._sounds_repetitive(text, context):
                 cue = NarrationCue(
                     text=text,
                     emotion=str(context["emotion"]),
@@ -465,10 +509,19 @@ class NarrationDirector:
             self._skip_streak += 1
             self._mark_suppressed("repeat_or_low_value", "代替文も直近と似ていたため抑制しました。")
             return None
+        if force_narration:
+            self._recent_keys.append(key)
+            self._skip_streak += 1
+            self._mark_suppressed("repeat_or_low_value", "停止時実況が空、または直近と似ていたため抑制しました。")
+            return None
 
-        fallback = build_narration_text(raw, command)
-        if self._was_recent(_normalize_for_repeat(fallback)):
-            fallback = _pick_first_fresh(_reaction_lines(context), self._recent_texts) or fallback
+        fallback = _clean_spoken_line(build_narration_text(raw, command)) or "流れを見て、次の判断に進みます。"
+        if self._was_recent(_normalize_for_repeat(fallback)) or self._sounds_repetitive(fallback, context):
+            fallback = (
+                _pick_first_fresh(_bridge_lines(context), self._recent_texts)
+                or _pick_first_fresh(_reaction_lines(context), self._recent_texts)
+                or fallback
+            )
         cue = NarrationCue(
             text=fallback,
             emotion=str(context["emotion"]),
@@ -481,6 +534,15 @@ class NarrationDirector:
 
     def record(self, cue: NarrationCue, key: str | None = None) -> None:
         self._recent_texts.append(cue.text)
+        opener = _line_opener(cue.text)
+        motif = _line_motif(cue.text)
+        if opener:
+            self._recent_openers.append(opener)
+        if motif:
+            self._recent_motifs.append(motif)
+        angle = _line_angle(cue.text)
+        if angle:
+            self._recent_angles.append(angle)
         if key:
             self._recent_keys.append(key)
         self._skip_streak = 0
@@ -498,6 +560,18 @@ class NarrationDirector:
 
     def _was_recent(self, normalized_text: str) -> bool:
         return _was_recent_text(normalized_text, self._recent_texts)
+
+    def _sounds_repetitive(self, text: str, context: dict[str, Any]) -> bool:
+        opener = _line_opener(text)
+        motif = _line_motif(text)
+        if opener and opener in self._recent_openers:
+            return True
+        if motif and motif in self._recent_motifs:
+            return True
+        angle = _line_angle(text)
+        if angle and len(self._recent_angles) >= 2 and all(recent == angle for recent in list(self._recent_angles)[-2:]):
+            return True
+        return False
 
     def _mark_suppressed(self, reason: str, text: str) -> None:
         self._last_suppression_reason = reason
@@ -531,14 +605,93 @@ def build_narration_candidates(
     context = context or _classify_context(raw, command)
     candidates: list[str] = []
     cleaned_model_text = _clean_spoken_line(model_text)
-    if cleaned_model_text:
+    model_is_bland = bool(cleaned_model_text and _is_bland_model_line(cleaned_model_text, context))
+    if context.get("pause_event"):
+        return _dedupe_ordered([cleaned_model_text] if cleaned_model_text else [])
+    if cleaned_model_text and not model_is_bland:
+        candidates.append(cleaned_model_text)
+    candidates.extend(_commentary_lines(raw, command, context))
+    if cleaned_model_text and model_is_bland:
         candidates.append(cleaned_model_text)
     candidates.extend(_reaction_lines(context))
     candidates.extend(_scene_lines(raw, command, context))
+    candidates.extend(_bridge_lines(context))
     fallback = build_narration_text(raw, command)
     if fallback:
         candidates.append(fallback)
-    return _dedupe_ordered(candidates)
+    cleaned_candidates = [_clean_spoken_line(candidate) for candidate in candidates]
+    return _dedupe_ordered([candidate for candidate in cleaned_candidates if candidate])
+
+
+def sanitize_spoken_text(text: str) -> str:
+    text = str(text)
+    for english, spoken in sorted(SPOKEN_NAME_REPLACEMENTS.items(), key=lambda item: len(item[0]), reverse=True):
+        text = re.sub(re.escape(english), spoken, text, flags=re.IGNORECASE)
+    text = text.replace("/", "対").replace("_", "")
+    text = re.sub(r"\b[A-Za-z][A-Za-z0-9' -]*\b", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([、。！？])", r"\1", text)
+    text = re.sub(r"([ぁ-んァ-ン一-龥])\s+(\d)", r"\1\2", text)
+    text = re.sub(r"(\d)\s+([ぁ-んァ-ン一-龥])", r"\1\2", text)
+    text = text.replace(" 。", "。").replace(" 、", "、")
+    text = _polite_spoken_text(text)
+    text = re.sub(r"^[、。,. !！?？]+", "", text).strip()
+    if len(text) > 60:
+        text = text[:60].rstrip("、。,. ") + "。"
+    return text
+
+
+def _line_opener(text: str) -> str:
+    normalized = text.strip()
+    for opener in (
+        "よし、",
+        "さて、",
+        "うわ、",
+        "ここは",
+        "まず",
+        "いけます",
+        "いいですね",
+        "さあ",
+        "痛いターン",
+    ):
+        if normalized.startswith(opener):
+            return opener.rstrip("、")
+    head = re.split(r"[、。！？]", normalized, maxsplit=1)[0]
+    return head[:6]
+
+
+def _line_motif(text: str) -> str:
+    normalized = _normalize_for_repeat(text)
+    motif_rules = (
+        ("取り切", "finish"),
+        ("倒し切", "finish"),
+        ("仕留", "finish"),
+        ("決め", "finish"),
+        ("押し切", "push"),
+        ("削", "chip"),
+        ("攻め", "attack"),
+        ("安定", "stabilize"),
+        ("踏ん張", "danger"),
+        ("集中", "danger"),
+        ("登塔", "start"),
+    )
+    for needle, motif in motif_rules:
+        if needle in normalized:
+            return motif
+    return ""
+
+
+def _line_angle(text: str) -> str:
+    normalized = _normalize_for_repeat(text)
+    if any(word in normalized for word in ("次の", "次ターン", "次に", "つなげ", "ドロー")):
+        return "forecast"
+    if any(word in normalized for word in ("点", "残り", "体力", "ブロック", "被弾")):
+        return "analysis"
+    if any(word in normalized for word in ("よし", "うわ", "いいですね", "いけます", "強い")):
+        return "reaction"
+    if any(word in normalized for word in ("前の", "流れ", "さっき", "ここまで")):
+        return "recap"
+    return "play_by_play"
 
 
 def should_narrate_command(command: str) -> bool:
@@ -553,11 +706,11 @@ def state_prefix(state: dict[str, Any]) -> str:
     max_hp = state.get("max_hp")
     parts = []
     if act and floor:
-        parts.append(f"Act {act}、{floor}階。")
+        parts.append(f"アクト{act}、{floor}階です。")
     elif floor:
-        parts.append(f"{floor}階。")
+        parts.append(f"{floor}階です。")
     if hp is not None and max_hp is not None:
-        parts.append(f"HPは{hp}/{max_hp}。")
+        parts.append(f"体力は{hp}対{max_hp}です。")
     return "".join(parts)
 
 
@@ -690,6 +843,38 @@ def _classify_context(raw: dict[str, Any], command: str) -> dict[str, Any]:
     importance = 1
     tags: set[str] = set()
 
+    pause_event = str(raw.get("_sts_ai_narration_event") or "").strip().lower()
+    requested_emotion = str(raw.get("_sts_ai_narration_emotion") or "").strip().lower()
+    requested_emotion = requested_emotion if requested_emotion in OFFICIAL_EMOTIONS else ""
+    if pause_event == "game_over":
+        return {
+            "screen_type": screen_type,
+            "verb": verb,
+            "key": f"PAUSE:{pause_event}",
+            "emotion": requested_emotion or "sad",
+            "reason": "game_over",
+            "importance": 4,
+            "tags": {"terminal", "pause", "game_over"},
+            "pause_event": pause_event,
+            "floor": state.get("floor"),
+            "hp": state.get("current_hp"),
+            "max_hp": state.get("max_hp"),
+        }
+    if pause_event == "max_floor":
+        return {
+            "screen_type": screen_type,
+            "verb": verb,
+            "key": f"PAUSE:{pause_event}",
+            "emotion": requested_emotion or "thinking",
+            "reason": "max_floor",
+            "importance": 3,
+            "tags": {"terminal", "pause", "max_floor"},
+            "pause_event": pause_event,
+            "floor": state.get("floor"),
+            "hp": state.get("current_hp"),
+            "max_hp": state.get("max_hp"),
+        }
+
     if verb == "START":
         return {
             "screen_type": screen_type,
@@ -699,6 +884,9 @@ def _classify_context(raw: dict[str, Any], command: str) -> dict[str, Any]:
             "reason": "run_start",
             "importance": 3,
             "tags": {"start", "hype"},
+            "floor": state.get("floor"),
+            "hp": state.get("current_hp"),
+            "max_hp": state.get("max_hp"),
         }
 
     if combat and screen_type in {"", "NONE"}:
@@ -738,6 +926,9 @@ def _classify_context(raw: dict[str, Any], command: str) -> dict[str, Any]:
         "reason": reason,
         "importance": importance,
         "tags": tags,
+        "floor": state.get("floor"),
+        "hp": state.get("current_hp"),
+        "max_hp": state.get("max_hp"),
     }
 
 
@@ -748,6 +939,16 @@ def _classify_combat_context(state: dict[str, Any], command: str, verb: str) -> 
     incoming = _estimate_incoming_damage(monsters)
     block = int(player.get("block") or 0)
     damage_gap = max(incoming - block, 0)
+    base_details: dict[str, Any] = {
+        "incoming": incoming,
+        "block": block,
+        "damage_gap": damage_gap,
+        "monster_count": len(monsters),
+        "energy": player.get("energy"),
+        "floor": state.get("floor"),
+        "hp": state.get("current_hp"),
+        "max_hp": state.get("max_hp"),
+    }
     emotion = "neutral"
     reason = "combat"
     importance = 2
@@ -772,27 +973,39 @@ def _classify_combat_context(state: dict[str, Any], command: str, verb: str) -> 
         else:
             reason = "turn_end"
             importance = 1
-        return _context("NONE", verb, key, emotion, reason, importance, tags)
+        return _context("NONE", verb, key, emotion, reason, importance, tags, base_details)
 
     if verb == "POTION":
         tags.add("potion")
-        return _context("NONE", verb, "POTION", "happy", "potion", 3, tags)
+        return _context("NONE", verb, "POTION", "happy", "potion", 3, tags, base_details)
 
     if verb != "PLAY":
-        return _context("NONE", verb, key, emotion, reason, importance, tags)
+        return _context("NONE", verb, key, emotion, reason, importance, tags, base_details)
 
     play = _parse_play_command(command)
     if play is None:
-        return _context("NONE", verb, key, emotion, reason, importance, tags)
+        return _context("NONE", verb, key, emotion, reason, importance, tags, base_details)
     card_index, target_index = play
     hand = combat.get("hand") or []
     card = hand[card_index] if 0 <= card_index < len(hand) and isinstance(hand[card_index], dict) else {}
     key = f"PLAY:{str(card.get('id') or card.get('name') or card_index)}"
+    details = dict(base_details)
+    details["card_name"] = str(card.get("name") or card.get("id") or "")
+    details["card_damage"] = _estimate_card_damage(card)
+    details["card_block"] = _estimate_card_block(card)
 
     if target_index is not None and 0 <= target_index < len(monsters):
         monster = monsters[target_index]
         damage = _estimate_card_damage(card)
         hp = int(monster.get("current_hp") or 0) + int(monster.get("block") or 0)
+        details.update(
+            {
+                "target_name": str(monster.get("name") or monster.get("id") or "敵"),
+                "target_hp": int(monster.get("current_hp") or 0),
+                "target_effective_hp": hp,
+                "target_block": int(monster.get("block") or 0),
+            }
+        )
         key = f"{key}:TARGET"
         tags.add("attack")
         if damage >= hp and damage > 0:
@@ -825,7 +1038,7 @@ def _classify_combat_context(state: dict[str, Any], command: str, verb: str) -> 
             tags.add("setup")
             emotion = "thinking"
             reason = "setup"
-    return _context("NONE", verb, key, emotion, reason, importance, tags)
+    return _context("NONE", verb, key, emotion, reason, importance, tags, details)
 
 
 def _context(
@@ -836,8 +1049,9 @@ def _context(
     reason: str,
     importance: int,
     tags: set[str],
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    context = {
         "screen_type": screen_type,
         "verb": verb,
         "key": key,
@@ -846,28 +1060,174 @@ def _context(
         "importance": importance,
         "tags": tags,
     }
+    if details:
+        context.update(details)
+    return context
+
+
+def _commentary_lines(raw: dict[str, Any], command: str, context: dict[str, Any]) -> list[str]:
+    tags = set(context.get("tags") or set())
+    if "combat" in tags:
+        return _combat_commentary_lines(command, context)
+    return _screen_commentary_lines(raw, command, context)
+
+
+def _combat_commentary_lines(command: str, context: dict[str, Any]) -> list[str]:
+    verb = str(context.get("verb") or command.split(" ", 1)[0]).upper()
+    incoming = _safe_int(context.get("incoming"))
+    block = _safe_int(context.get("block"))
+    damage_gap = _safe_int(context.get("damage_gap"))
+    card_name = sanitize_spoken_text(str(context.get("card_name") or "")).strip()
+    target_name = sanitize_spoken_text(str(context.get("target_name") or "敵")).strip() or "敵"
+    target_hp = _safe_int(context.get("target_hp"))
+    effective_hp = _safe_int(context.get("target_effective_hp")) or target_hp
+    damage = _safe_int(context.get("card_damage"))
+    block_gain = _safe_int(context.get("card_block"))
+    tags = set(context.get("tags") or set())
+    reason = str(context.get("reason") or "")
+    lines: list[str] = []
+
+    if verb == "END":
+        if damage_gap > 0:
+            lines.append(f"ここで{damage_gap}点ほど受けます。次の手札で立て直したいですね。")
+            lines.append(f"ブロックは{block}点です。被弾込みで次のターンを迎えます。")
+        else:
+            lines.append("被弾は抑えました。次のドローを見て攻め直します。")
+        return lines
+
+    if verb != "PLAY":
+        if incoming > 0:
+            return [f"相手は合計{incoming}点を構えています。ここは判断が重いですね。"]
+        return []
+
+    if "lethal" in tags:
+        if target_hp > 0:
+            lines.append(f"{target_name}は残り{target_hp}です。ここで落とせると被弾がぐっと楽になります。")
+        lines.append(f"{card_name or 'この一手'}で取り切ります。ここは逃したくない場面です。")
+        return lines
+
+    if "block" in tags:
+        if incoming > 0:
+            covered = min(incoming, block + block_gain)
+            lines.append(f"相手の攻撃は合計{incoming}点です。ここで{covered}点ぶん受けを作ります。")
+            if damage_gap > 0 and block + block_gain < incoming:
+                lines.append(f"全部は止まりませんが、被弾を{max(incoming - block - block_gain, 0)}点まで抑えます。")
+            else:
+                lines.append("ここを守り切れれば、次のターンに攻め直せます。")
+        else:
+            lines.append(f"{card_name or '防御札'}で守りを厚くします。次の展開を待ちます。")
+        return lines
+
+    if reason == "race" or "push" in tags:
+        lines.append(f"相手は{incoming}点を構えていますが、先に倒す圧をかけます。")
+        if target_hp > 0 and damage > 0:
+            lines.append(f"{target_name}は残り{target_hp}です。{damage}点を入れて勝負を急ぎます。")
+        lines.append("被弾は残りますが、次のリーサルを近づける一手です。")
+        return lines
+
+    if reason == "attack":
+        if incoming == 0:
+            lines.append(f"今は被弾がありません。{card_name or '攻撃'}で先に形を作ります。")
+        elif target_hp > 0 and damage > 0:
+            lines.append(f"{target_name}は残り{target_hp}です。受けよりも討伐までの距離を縮めます。")
+        if effective_hp > damage > 0:
+            lines.append(f"この一撃で残り{max(effective_hp - damage, 0)}点まで近づきます。次が見えてきますね。")
+        else:
+            lines.append("小さな打点でも、後のリーサルを作る一手です。")
+        return lines
+
+    if "setup" in tags:
+        return ["今すぐの打点より、次の形を整えます。", "ここは後の強いターンを作る準備です。"]
+    return []
+
+
+def _screen_commentary_lines(raw: dict[str, Any], command: str, context: dict[str, Any]) -> list[str]:
+    state = raw.get("game_state") or {}
+    if not isinstance(state, dict):
+        return []
+    screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
+    hp = state.get("current_hp")
+    max_hp = state.get("max_hp")
+    if screen_type == "MAP":
+        return ["次の戦闘まで見据えてルートを選びます。", "ここから先の休憩所とエリート位置が大事になります。"]
+    if screen_type == "CARD_REWARD":
+        return ["この報酬は、次の数戦を楽にできるかで見ます。", "今のデッキに足りない役割を埋めたいですね。"]
+    if screen_type == "COMBAT_REWARD":
+        return ["戦闘後の回収です。ここで次の部屋への準備を整えます。"]
+    if screen_type == "EVENT":
+        if hp is not None and max_hp is not None:
+            return [f"体力は{hp}対{max_hp}です。イベントのリスクは慎重に見ます。"]
+        return ["イベントはリターンだけでなく、失うものも見て判断します。"]
+    if screen_type == "REST":
+        return ["ここは強化か回復か、ラン全体の分かれ目です。"]
+    if screen_type == "SHOP_SCREEN":
+        return ["お金の使い道で、この先の安定感がかなり変わります。"]
+    return []
+
+
+def _is_bland_model_line(text: str, context: dict[str, Any]) -> bool:
+    if context.get("pause_event") or str(context.get("reason") or "") in {"game_over", "max_floor"}:
+        return False
+    normalized = _normalize_for_repeat(text)
+    specific_values = [
+        context.get("card_name"),
+        context.get("target_name"),
+        context.get("target_hp"),
+        context.get("incoming"),
+        context.get("damage_gap"),
+    ]
+    for value in specific_values:
+        if value is None or value == "":
+            continue
+        spoken = sanitize_spoken_text(str(value))
+        if spoken and _normalize_for_repeat(spoken) in normalized:
+            return False
+    if re.search(r"\d", text):
+        return False
+    bland_words = ("ここは", "よし", "まず", "攻め", "押し", "削", "テンポ", "大事", "選択", "前のめり")
+    return len(normalized) <= 24 or any(word in text for word in bland_words)
 
 
 def _reaction_lines(context: dict[str, Any]) -> list[str]:
     tags = set(context.get("tags") or set())
     reason = str(context.get("reason") or "")
     if "lethal" in tags:
-        return ["よっしゃ、ここで取り切る！", "いけーー！倒し切れ！", "そこだ、決めにいく！"]
+        return ["よし、ここで取り切ります！", "いけます、倒し切りましょう！", "そこです、決めにいきます！"]
     if "danger" in tags:
-        return ["うわ、ここは踏ん張りどころ！", "痛いターン、集中していこう。", "ここを越えればまだある！"]
+        return ["うわ、ここは踏ん張りどころです！", "痛いターンです、集中しましょう。", "ここを越えればまだあります！"]
     if "potion" in tags:
-        return ["よし、ここで切る！", "出し惜しみなしでいこう。", "ポーション投入、勝負どころ！"]
+        return ["よし、ここで使います！", "出し惜しみなしでいきましょう。", "ポーション投入、勝負どころです！"]
     if "stabilize" in tags:
-        return ["よっしゃ、受け切れる！", "ここは守りが光る！", "きれいに耐えにいく！"]
+        return ["よし、受け切れます！", "ここは守りが光ります！", "きれいに耐えにいきます！"]
     if reason == "attack":
-        return ["いけーー！まず削る！", "いいぞ、攻めていこう！", "ここは前のめりでいく！"]
+        return ["いけます、まず削ります！", "いいですね、攻めていきましょう！", "ここは前のめりでいきます！"]
     if "skip" in tags:
-        return ["取らない勇気、あります。", "ここはスルーで締める。", "今のデッキには入れません。"]
+        return ["取らない勇気も大事です。", "ここはスルーで締めます。", "今のデッキには入れません。"]
     if "choice" in tags:
-        return ["さて、ここは悩みどころ。", "この選択、大事です。", "次につながる方を選ぶ！"]
+        return ["さて、ここは悩みどころです。", "この選択、大事です。", "次につながる方を選びます！"]
     if "start" in tags:
-        return ["よっしゃ、登塔開始！", "さあ行こう、まずは一勝！", "開幕から集中していく！"]
-    return ["よし、次いこう！", "テンポよく進めます。", "ここは迷わずいきます。"]
+        return ["よし、登塔開始です！", "さあ行きましょう、まずは一勝です！", "開幕から集中していきます！"]
+    return ["よし、次へ行きましょう！", "テンポよく進めます。", "ここは迷わずいきます。"]
+
+
+def _bridge_lines(context: dict[str, Any]) -> list[str]:
+    tags = set(context.get("tags") or set())
+    reason = str(context.get("reason") or "")
+    if "lethal" in tags:
+        return ["決め手は見えています。落ち着いて処理します。", "盤面の圧を一つ減らします。"]
+    if "danger" in tags:
+        return ["苦しい場面ですが、次のターンを残します。", "今は崩れないことを優先します。"]
+    if "potion" in tags:
+        return ["温存よりも、この場面の解決を優先します。"]
+    if "stabilize" in tags:
+        return ["守りの形が整います。次の手番につなげます。"]
+    if reason == "attack":
+        return ["テンポを保って前に出ます。", "相手の体力を見ながら詰めます。"]
+    if "choice" in tags:
+        return ["次の展開を見据えた選択です。", "リスクと伸びしろを見比べます。"]
+    if "skip" in tags:
+        return ["余計なノイズを増やさない判断です。"]
+    return ["流れを崩さず進めます。", "次の判断につながる一手です。"]
 
 
 def _scene_lines(raw: dict[str, Any], command: str, context: dict[str, Any]) -> list[str]:
@@ -879,15 +1239,15 @@ def _scene_lines(raw: dict[str, Any], command: str, context: dict[str, Any]) -> 
         return _combat_scene_lines(state, command, context)
     screen_type = str(state.get("screen_type") or state.get("screen_name") or "").upper()
     if screen_type == "CARD_REWARD":
-        return ["報酬選び、ここでデッキを締める！", "次の戦闘を見て選びます。"]
+        return ["報酬選びです。ここでデッキを整えます！", "次の戦闘を見て選びます。"]
     if screen_type == "MAP":
-        return ["ルート選択、勝負の分かれ目です。", "次の部屋、ここへ進む！"]
+        return ["ルート選択、勝負の分かれ目です。", "次の部屋はここへ進みます！"]
     if screen_type == "REST":
         return ["休憩所、ここは大事な判断。", "焚き火で立て直します。"]
     if screen_type == "SHOP_SCREEN":
-        return ["買い物は勝ち筋づくりです。", "ここで必要なものだけ取る！"]
+        return ["買い物は勝ち筋づくりです。", "ここで必要なものだけ取ります！"]
     if screen_type == "EVENT":
-        return ["イベント判断、リスクを見ます。", "ここは展開を見て選ぶ！"]
+        return ["イベント判断、リスクを見ます。", "ここは展開を見て選びます！"]
     return []
 
 
@@ -905,18 +1265,18 @@ def _combat_scene_lines(state: dict[str, Any], command: str, context: dict[str, 
         if card_name:
             if "lethal" in tags and target_index is not None and 0 <= target_index < len(monsters):
                 monster_name = str(monsters[target_index].get("name") or "敵")
-                lines.append(f"{card_name}で{monster_name}を仕留める！")
+                lines.append(f"{card_name}で{monster_name}を仕留めます！")
             elif "block" in tags:
-                lines.append(f"{card_name}でしっかり受ける！")
+                lines.append(f"{card_name}でしっかり受けます！")
             elif "attack" in tags:
-                lines.append(f"{card_name}、ここで押し込む！")
+                lines.append(f"{card_name}、ここで押し込みます！")
             elif "setup" in tags:
                 lines.append(f"{card_name}で次の形を作る。")
     if command.split(" ", 1)[0].upper() == "END":
         if "danger" in tags:
-            lines.append("ターン終了、被弾は覚悟です。")
+            lines.append("ターン終了です。被弾は覚悟します。")
         else:
-            lines.append("やることはやった、ターン終了。")
+            lines.append("やることはやりました。ターン終了です。")
     return lines
 
 
@@ -925,6 +1285,14 @@ def _cue_style(context: dict[str, Any]) -> dict[str, Any]:
     importance = int(context.get("importance") or 0)
     reason = str(context.get("reason") or "")
 
+    if "terminal" in tags or reason in {"game_over", "max_floor"}:
+        return {
+            "pace": "slow" if reason == "game_over" else "normal",
+            "intensity": "normal",
+            "priority": 10 if reason == "game_over" else 7,
+            "queue_policy": "replaceIfHigherPriority",
+            "max_queue_ms": 3000,
+        }
     if "lethal" in tags:
         return {
             "pace": "fast",
@@ -1003,14 +1371,53 @@ def _supported_values(value: Any, fallback: set[str]) -> set[str]:
     return values or fallback
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _clean_spoken_line(value: str | None) -> str | None:
     if not value:
         return None
     text = " ".join(str(value).split()).strip()
     if not text:
         return None
-    if len(text) > 60:
-        text = text[:60].rstrip("、。,. ") + "。"
+    return sanitize_spoken_text(text)
+
+
+def _polite_spoken_text(text: str) -> str:
+    replacements = {
+        "いけーー": "いけます",
+        "いけー": "いけます",
+        "行こう": "行きましょう",
+        "いこう": "いきましょう",
+        "行く！": "行きます！",
+        "いく！": "いきます！",
+        "進むぞ！": "進みます！",
+        "進むぞ": "進みます",
+        "倒し切れ": "倒し切りましょう",
+        "取り切る": "取り切ります",
+        "受け切れる": "受け切れます",
+        "まず削る": "まず削ります",
+        "押し込む": "押し込みます",
+        "選ぶ！": "選びます！",
+        "取る！": "取ります！",
+        "締める": "締めます",
+        "作る。": "作ります。",
+        "ターン終了。": "ターン終了です。",
+        "覚悟です。": "覚悟します。",
+        "チャンス！": "チャンスです！",
+    }
+    for before, after in replacements.items():
+        text = text.replace(before, after)
+    if text.endswith("だ！"):
+        text = text[:-2] + "です！"
+    if text.endswith("だ。"):
+        text = text[:-2] + "です。"
+    if text.endswith("ぞ！"):
+        text = text[:-2] + "ます！"
     return text
 
 

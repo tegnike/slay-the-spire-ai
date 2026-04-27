@@ -85,9 +85,7 @@ def run_protocol(options: Options) -> int:
                         narration_status_reason = narration_client.last_status_reason
                 else:
                     narration_text = cue.text
-                    narration_emotion = str(payload.get("_sts_ai_narration_emotion") or cue.emotion)
-                    if narration_emotion not in OFFICIAL_EMOTIONS:
-                        narration_emotion = cue.emotion
+                    narration_emotion = cue.emotion
                     narration_style = {
                         "pace": cue.pace,
                         "intensity": cue.intensity,
