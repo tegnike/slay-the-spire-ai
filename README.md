@@ -218,5 +218,7 @@ ModTheSpire の直接起動でクラッシュする場合:
 
 ## 詳細資料
 
+- [docs/narration-integration-patterns.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/narration-integration-patterns.md): 今回改善したナレーター連携を他ゲームへ移植するための設計メモ
+
 - [docs/setup.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/setup.md): Mod 配置、CommunicationMod 設定、起動確認の詳細
 - [docs/session-notes-2026-04-26.md](/Users/user/WorkSpace/local-tasks-repository/slay-the-spire-ai/docs/session-notes-2026-04-26.md): 初回構築時に確認したパス、ログ、判断メモ
